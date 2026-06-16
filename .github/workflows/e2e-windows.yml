@@ -44,14 +44,13 @@ jobs:
       - name: Setup Rust
         if: steps.installer-cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@1.96.0 # stable
+      - name: checkout full tree on cache miss
+        if: steps.installer-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
 
       - name: Install npm dependencies
         if: steps.installer-cache.outputs.cache-hit != 'true'
         run: npm ci
-
-      - name: checkout full tree on cache miss
-        if: steps.installer-cache.outputs.cache-hit != 'true'
-        uses: actions/checkout@v4
 
       - name: Cache Rust targets
         if: steps.installer-cache.outputs.cache-hit != 'true'
