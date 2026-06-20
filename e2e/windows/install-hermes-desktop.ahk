@@ -1,6 +1,15 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
-#ErrorStdOut "UTF-8"
+
+OnError(LogError)
+
+LogError(err, mode) {
+    FileAppend(
+        "Unhandled error: " err.Message "`n",
+        "*"
+    )
+    return -1  ; suppress the standard error dialog
+}
 
 SetWorkingDir(A_ScriptDir)
 CoordMode("Pixel", "Screen")
@@ -42,9 +51,11 @@ ClickCenterOfImageInWindow(winTitle, imageFile, timeoutMs := 10000, intervalMs :
 {
     WinGetPos(&wx, &wy, &ww, &wh, winTitle)
 
-    img := LoadPicture(imageFile, , &imgType)
-    width := img.W
-    height := img.H
+    pic := Gui()
+    ctrl := pic.AddPicture(, imageFile)
+    width := ctrl.Value.Width
+    height := ctrl.Value.Height
+    pic.Destroy()
 
     startTime := A_TickCount
 
