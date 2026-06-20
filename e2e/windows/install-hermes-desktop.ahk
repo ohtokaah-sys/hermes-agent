@@ -1,6 +1,15 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 
+
+logPath := A_Args.Length >= 1 ? A_Args[1] : "ahk.log"
+
+Log(text) {
+    ToolTip(text)
+    FileAppend(text, '*')
+    FileAppend(text, logPath)
+}
+
 OnError(LogError)
 
 LogError(err, mode) {
@@ -8,14 +17,16 @@ LogError(err, mode) {
         "Unhandled error: " err.Message "`n",
         "*"
     )
+    FileAppend(
+        "Unhandled error: " err.Message "`n",
+        logPath
+    )
     return -1  ; suppress the standard error dialog
 }
 
 SetWorkingDir(A_ScriptDir)
 CoordMode("Pixel", "Screen")
 CoordMode("Mouse", "Screen")
-
-logPath := A_Args.Length >= 1 ? A_Args[1] : "ahk.log"
 
 
 ClickWithMarker(x, y, button := "Left") {
@@ -76,28 +87,27 @@ ClickCenterOfImageInWindow(winTitle, imageFile, timeoutMs := 10000, intervalMs :
 
         Sleep intervalMs
         timeLeft := timeoutMs - (A_TickCount - startTime)
-        ToolTip(Format("Searching for button {} in window {}...  {}s left", imageFile, winTitle, timeLeft / 1000))
+        Log(Format("Searching for button {} in window {}...  {}s left", imageFile, winTitle, timeLeft / 1000))
     }
 
     throw Error(Format("Failed to find button {} in window {}", imageFile, winTitle))
 }
 
 
-ToolTip("Waiting for the installer window to appear...")
+Log("Waiting for the installer window to appear...")
 winTitle := "Hermes"
 try {
     WinWait(winTitle, , 30)
 } catch {
-    FileAppend("ERROR: Hermes installer window did not appear within 30s`n", logPath)
+    Log("ERROR: Hermes installer window did not appear within 30s`n")
     ExitApp(1)
 }
 WinGetPos(&x, &y, &w, &h, winTitle)
-FileAppend(Format("Window found at x={1} y={2} w={3} h={4}`n", x, y, w, h), logPath)
-ToolTip(Format("Installer window appeared at x={1} y={2} w={3} h={4}. Sleeping for a few seconds.....", x, y, w, h))
+Log(Format("Window found at x={1} y={2} w={3} h={4}`n", x, y, w, h))
 
 ClickCenterOfImageInWindow(winTitle, "install-button.png")
 
-ClickCenterOfImageInWindow(winTitle, "install-button.png", 60 * 60 * 20)
+ClickCenterOfImageInWindow(winTitle, "install-button.png", 1000 * 60 * 10)
 
 
 ; done
