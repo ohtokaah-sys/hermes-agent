@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
@@ -82,7 +82,7 @@ describe('BillingSettings', () => {
     expect(screen.getByText('Default ceiling')).toBeTruthy()
   })
 
-  it('renders the post-train payload with disabled preset chips and card provenance', async () => {
+  it('renders the post-train payload with enabled buy controls and card provenance', async () => {
     apiMocks.fetchBillingState.mockResolvedValue(okBilling(postTrainBillingState))
     apiMocks.fetchSubscriptionState.mockResolvedValue(okSubscription(postTrainSubscriptionState))
 
@@ -90,10 +90,52 @@ describe('BillingSettings', () => {
 
     expect(await screen.findByText('$142.50')).toBeTruthy()
     expect(screen.getByText('Visa •••• 4242 - subscription card')).toBeTruthy()
+    expect(screen.getByRole('button', { name: '$25' }).hasAttribute('disabled')).toBe(false)
+    expect(screen.getByRole('button', { name: '$50' }).hasAttribute('disabled')).toBe(false)
+    expect(screen.getByRole('button', { name: '$100' }).hasAttribute('disabled')).toBe(false)
+    expect(screen.getByRole('spinbutton', { name: 'Custom credit amount' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /^Buy$/ }).hasAttribute('disabled')).toBe(false)
+  })
+
+  it('disables buy controls while polling and renders the settled outcome', async () => {
+    let settleStatus: (value: unknown) => void = () => {}
+
+    const statusPromise = new Promise(resolve => {
+      settleStatus = resolve
+    })
+
+    apiMocks.fetchBillingState.mockResolvedValue(okBilling(postTrainBillingState))
+    apiMocks.fetchSubscriptionState.mockResolvedValue(okSubscription(postTrainSubscriptionState))
+    apiMocks.charge.mockResolvedValue({
+      data: {
+        charge_id: 'ch_123',
+        ok: true
+      },
+      idempotencyKey: 'key-1',
+      ok: true
+    })
+    apiMocks.chargeStatus.mockReturnValue(statusPromise)
+
+    renderBilling()
+
+    fireEvent.click(await screen.findByRole('button', { name: /^Buy$/ }))
+
+    expect(await screen.findByText('Processing… checking settlement')).toBeTruthy()
     expect(screen.getByRole('button', { name: '$25' }).hasAttribute('disabled')).toBe(true)
     expect(screen.getByRole('button', { name: '$50' }).hasAttribute('disabled')).toBe(true)
-    expect(screen.getByRole('button', { name: '$100' }).hasAttribute('disabled')).toBe(true)
+    expect(screen.getByRole('spinbutton', { name: 'Custom credit amount' }).hasAttribute('disabled')).toBe(true)
     expect(screen.getByRole('button', { name: /^Buy$/ }).hasAttribute('disabled')).toBe(true)
+
+    settleStatus({
+      data: {
+        amount_usd: '25',
+        ok: true,
+        status: 'settled'
+      },
+      ok: true
+    })
+
+    await waitFor(() => expect(screen.getByText('$25 added. Balance is refreshing.')).toBeTruthy())
   })
 
   it('renders logged-out as a connect card without normal account rows', async () => {
