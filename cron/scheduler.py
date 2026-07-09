@@ -244,6 +244,66 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
 
+# ── Post-hook type mapping ──
+# Each hook type maps to a script in ~/.hermes/hooks/.
+# Scripts receive the job output file path as $1 and the job ID as $2.
+# Exit 0 = passed, any other code = shard logged.
+HOOK_TYPE_SCRIPT_MAP = {
+    "always_pass": "_always_pass.sh",
+    "file_check": "_check_file.sh",
+    "content_check": "_check_output.sh",
+    "exit_check": "_check_output_keywords.sh",
+    "state_check": "_check_state.sh",
+}
+
+def _execute_post_hook(job: dict, output_dir: Path) -> bool:
+    """Run post-processing hook if the job has one configured.
+
+    Returns True if hook passed (or not configured), False if failed.
+    """
+    hook_cfg = job.get("post_hook")
+    if not hook_cfg:
+        return True
+
+    hook_type = hook_cfg.get("type") if isinstance(hook_cfg, dict) else str(hook_cfg)
+    script_name = HOOK_TYPE_SCRIPT_MAP.get(hook_type)
+    if not script_name:
+        logger.warning("Job '%s': unknown post_hook type '%s' — skipping", job["id"], hook_type)
+        return True
+
+    hooks_dir = Path(get_hermes_home()) / "hooks"
+    script_path = hooks_dir / script_name
+    if not script_path.exists():
+        logger.warning("Job '%s': post_hook script not found: %s — skipping", job["id"], script_path)
+        return True
+
+    # Find latest output file
+    output_files = sorted(output_dir.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
+    if not output_files:
+        logger.warning("Job '%s': post_hook configured but no output files in %s", job["id"], output_dir)
+        return True
+
+    try:
+        result = subprocess.run(
+            [str(script_path), str(output_files[0]), job["id"]],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            logger.error(
+                "Job '%s': post_hook '%s' FAILED (exit %d): %s",
+                job["id"], hook_type, result.returncode,
+                result.stderr.strip() or result.stdout.strip()[:200],
+            )
+            return False
+        logger.debug("Job '%s': post_hook '%s' PASSED", job["id"], hook_type)
+        return True
+    except subprocess.TimeoutExpired:
+        logger.error("Job '%s': post_hook '%s' TIMED OUT", job["id"], hook_type)
+        return False
+    except Exception as exc:
+        logger.error("Job '%s': post_hook '%s' ERROR: %s", job["id"], hook_type, exc)
+        return False
+
 # Canonical silence tokens recognized in cron output.  Cron's contract is
 # intentionally looser than the gateway's exact-whole-response rule: the cron
 # system prompt *instructs* the agent to emit "[SILENT]", and real agents often
@@ -3427,6 +3487,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             output_file = save_job_output(job["id"], output)
             if verbose:
                 logger.info("Output saved to: %s", output_file)
+
+            # ── Post-hook execution: validate output before delivery ──
+            if success:
+                job_output_dir = output_file.parent
+                if not _execute_post_hook(job, job_output_dir):
+                    logger.warning("Job '%s': post_hook failed — output may be incomplete", job["id"])
+                    # Don't block delivery, just flag — hook failure is advisory
 
             # If the gateway shutdown killed this job's tool subprocess
             # mid-flight (#60432), the agent may still have produced a
