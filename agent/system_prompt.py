@@ -9,16 +9,13 @@ fork inherits the cached prompt verbatim.
 
 Three tiers are joined with ``\\n\\n``:
 
-* ``stable``   — identity (SOUL.md or DEFAULT_AGENT_IDENTITY), tool
-  guidance, computer-use guidance, nous subscription block, tool-use
-  enforcement guidance + per-model operational guidance, skills prompt,
-  alibaba model-name workaround, environment hints, platform hints.
+* ``stable``   — USER.md identity anchor (P1-6: 先认识人再加载规则), then
+  SOUL.md (behavioral constitution), tool guidance, skills prompt,
+  environment hints, platform hints, model-family operational guidance.
+* ``volatile`` — memory snapshot (MEMORY.md only — USER.md 前移到 stable),
+  external memory provider block, timestamp line.
+ 
 * ``context``  — caller-supplied ``system_message`` plus context files
-  (AGENTS.md / .cursorrules / etc.) discovered under ``TERMINAL_CWD``.
-* ``volatile`` — memory snapshot, USER.md profile, external memory
-  provider block, timestamp/session/model/provider line.
-
-Pure helpers that read the agent's state.  AIAgent keeps thin forwarders.
 """
 
 from __future__ import annotations
@@ -178,6 +175,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
+
+    # Inject user profile before agent identity in system prompt
+    # 再加载行为规则。在深度绑定的 1:1 场景下，规则的适用性和优先级取决于用户身份。
+    if agent._memory_store and agent._user_profile_enabled:
+        user_block = agent._memory_store.format_for_system_prompt("user")
+        if user_block:
+            stable_parts.append(user_block)
 
     # Try SOUL.md as primary identity unless the caller explicitly skipped it.
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
@@ -462,11 +466,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             mem_block = agent._memory_store.format_for_system_prompt("memory")
             if mem_block:
                 volatile_parts.append(mem_block)
-        # USER.md is always included when enabled.
-        if agent._user_profile_enabled:
-            user_block = agent._memory_store.format_for_system_prompt("user")
-            if user_block:
-                volatile_parts.append(user_block)
+        # USER.md 已前移到 stable tier（P1-6），不再出现在 volatile 中。
 
     # External memory provider system prompt block (additive to built-in)
     if agent._memory_manager:

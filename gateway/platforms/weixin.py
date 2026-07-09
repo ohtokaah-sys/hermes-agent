@@ -140,6 +140,39 @@ ITEM_VOICE = 3
 ITEM_FILE = 4
 ITEM_VIDEO = 5
 
+# ── 引用消息缓存（2026-07-08）──
+# WeChat iLink 协议变更：ref_msg 不再内嵌文字，只发 msg_id。
+# 此缓存存储每条消息的文本，供引用消息提取时回退查找。
+from collections import OrderedDict
+_MAX_MSG_CACHE_SIZE = 500
+_msg_text_cache: "OrderedDict[str, str]" = OrderedDict()
+
+def _cache_message_text(msg_id: str, text: str) -> None:
+    _msg_text_cache[msg_id] = text
+    _msg_text_cache.move_to_end(msg_id)
+    while len(_msg_text_cache) > _MAX_MSG_CACHE_SIZE:
+        _msg_text_cache.popitem(last=False)
+
+# 出站消息时间队列：iLink send 响应不含 msg_id，用时间戳近似匹配
+_MAX_OUTBOUND_QUEUE = 50
+_outbound_queue: "list[tuple[int, str]]" = []  # [(timestamp_ms, text)]
+
+def _record_outbound(text: str) -> None:
+    import time as _time
+    _outbound_queue.append((int(_time.time() * 1000), text))
+    while len(_outbound_queue) > _MAX_OUTBOUND_QUEUE:
+        _outbound_queue.pop(0)
+
+def _lookup_outbound(ref_time_ms: int) -> "str | None":
+    """找到 create_time_ms 之前最近的一条出站消息"""
+    best = None
+    for ts, txt in _outbound_queue:
+        if ts <= ref_time_ms:
+            best = txt
+        else:
+            break
+    return best
+
 MSG_TYPE_USER = 1
 MSG_TYPE_BOT = 2
 MSG_STATE_FINISH = 2
@@ -954,6 +987,28 @@ def _extract_text(item_list: List[Dict[str, Any]]) -> str:
                 if ref.get("title"):
                     parts.append(str(ref["title"]))
                 ref_text = _extract_text([ref_item])
+                # 缓存回退：WeChat iLink 新版 ref_msg 只含 msg_id 不含文字
+                if not ref_text:
+                    ref_msg_id = str(ref_item.get("msg_id")) if ref_item.get("msg_id") else None
+                    cached = _msg_text_cache.get(ref_msg_id) if ref_msg_id else None
+                    if cached:
+                        ref_text = cached
+                    else:
+                        ref_time_ms = None
+                        if ref_item:
+                            ref_time_ms = ref_item.get("create_time_ms") or ref_item.get("create_time")
+                        if ref_time_ms:
+                            try:
+                                outbound_text = _lookup_outbound(int(ref_time_ms))
+                                if outbound_text:
+                                    ref_text = outbound_text
+                                    logger.warning("[Weixin] refmsg cache TIME-MATCH: ts=%s len=%d", ref_time_ms, len(outbound_text))
+                                else:
+                                    ref_text = "[引用消息]"
+                            except (ValueError, TypeError):
+                                ref_text = "[引用消息]"
+                        else:
+                            ref_text = "[引用消息]"
                 if ref_text:
                     parts.append(ref_text)
                 if parts:
@@ -1421,6 +1476,32 @@ class WeixinAdapter(BasePlatformAdapter):
                 logger.debug("[%s] Content-dedup: skipping duplicate message from %s", self.name, sender_id)
                 return
 
+        # 引用消息缓存：将每条入站消息存入缓存（供 ref_msg 三层回退查找）
+        cache_key = str(message.get("message_id") or "").strip()
+        if cache_key:
+            for item in item_list:
+                item_type = item.get("type")
+                cached_text = None
+                if item_type == ITEM_TEXT:
+                    cached_text = str((item.get("text_item") or {}).get("text") or "").strip()
+                elif item_type == ITEM_IMAGE:
+                    img = item.get("image_item") or {}
+                    cached_text = f"[图片] {img.get('width', '?')}x{img.get('height', '?')}"
+                elif item_type == ITEM_VIDEO:
+                    vid = item.get("video_item") or {}
+                    cached_text = f"[视频] {vid.get('duration', '?')}s"
+                elif item_type == ITEM_FILE:
+                    f_item = item.get("file_item") or {}
+                    fname = f_item.get("file_name") or f_item.get("title") or "文件"
+                    fsize = f_item.get("size") or 0
+                    cached_text = f"[文件] {fname} ({fsize}B)"
+                elif item_type == ITEM_VOICE:
+                    cached_text = str((item.get("voice_item") or {}).get("text") or "").strip()
+                if cached_text:
+                    _cache_message_text(cache_key, cached_text)
+                    logger.debug("[Weixin] refmsg cache INBOUND: key=%s type=%s len=%d",
+                        cache_key[:40], item_type, len(cached_text))
+
         chat_type, effective_chat_id = _guess_chat_type(message, self._account_id)
         if chat_type == "group":
             if self._group_policy == "disabled":
@@ -1816,6 +1897,10 @@ class WeixinAdapter(BasePlatformAdapter):
                             f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
                         )
                 self._reset_rate_limit_circuit()
+                # 出站消息时间戳记录：供引用消息时间窗口匹配
+                if chunk:
+                    _record_outbound(chunk)
+                    logger.debug("[Weixin] refmsg cache OUTBOUND: queue=%d len=%d", len(_outbound_queue), len(chunk))
                 return
             except Exception as exc:
                 last_error = exc
@@ -1845,6 +1930,23 @@ class WeixinAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
+
+        # ── P027: Global rate-limit cooldown gate ──
+        # Wait at send() entry so no outbound traffic leaves while iLink is
+        # rate-limiting us. Max 2 full cooldown rounds before giving up.
+        _rate_limit_rounds = 0
+        while True:
+            remaining = self._rate_limit_cooldown_remaining()
+            if remaining <= 0:
+                break
+            if _rate_limit_rounds >= 2:
+                logger.error("[%s] rate limit cooldown still active after 2 rounds — giving up", self.name)
+                return SendResult(success=False, error="iLink rate limited; cooldown still active after 2 rounds")
+            logger.warning("[%s] rate limit cooldown %.1fs — waiting before send (round %d/2)",
+                self.name, remaining, _rate_limit_rounds + 1)
+            await asyncio.sleep(remaining)
+            _rate_limit_rounds += 1
+
         context_token = self._token_store.get(self._account_id, chat_id)
         last_message_id: Optional[str] = None
 
@@ -1862,28 +1964,46 @@ class WeixinAdapter(BasePlatformAdapter):
         async def _deliver_media(path: str, is_voice: bool = False) -> None:
             ext = Path(path).suffix.lower()
             if is_voice or ext in _AUDIO_EXTS:
-                await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata)
+                result = await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata)
             elif ext in _VIDEO_EXTS:
-                await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
+                result = await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
             elif ext in _IMAGE_EXTS:
-                await self.send_image_file(chat_id=chat_id, image_path=path, metadata=metadata)
+                result = await self.send_image_file(chat_id=chat_id, image_path=path, metadata=metadata)
             else:
-                await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+                result = await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+            if not result.success:
+                raise RuntimeError(f"{ext} delivery failed: {result.error}")
+
+        failed_deliveries: list[tuple[str, str]] = []  # [(path, reason), ...]
 
         try:
             # Deliver extracted MEDIA: attachments first.
             for media_path, is_voice in media_files:
-                try:
-                    await _deliver_media(media_path, is_voice)
-                except Exception as exc:
-                    logger.warning("[%s] media delivery failed for %s: %s", self.name, media_path, exc)
+                for attempt in (1, 2):
+                    try:
+                        await _deliver_media(media_path, is_voice)
+                        break
+                    except Exception as exc:
+                        if attempt == 1:
+                            logger.warning("[%s] media delivery attempt 1 failed for %s: %s — retrying in 2s", self.name, media_path, exc)
+                            await asyncio.sleep(2)
+                        else:
+                            logger.error("[%s] media delivery failed for %s after 2 attempts: %s", self.name, media_path, exc)
+                            failed_deliveries.append((media_path, str(exc)))
 
             # Deliver bare local file paths.
             for file_path in local_files:
-                try:
-                    await _deliver_media(file_path, is_voice=False)
-                except Exception as exc:
-                    logger.warning("[%s] local file delivery failed for %s: %s", self.name, file_path, exc)
+                for attempt in (1, 2):
+                    try:
+                        await _deliver_media(file_path, is_voice=False)
+                        break
+                    except Exception as exc:
+                        if attempt == 1:
+                            logger.warning("[%s] local file delivery attempt 1 failed for %s: %s — retrying in 2s", self.name, file_path, exc)
+                            await asyncio.sleep(2)
+                        else:
+                            logger.error("[%s] local file delivery failed for %s after 2 attempts: %s", self.name, file_path, exc)
+                            failed_deliveries.append((file_path, str(exc)))
 
             # Deliver text content.
             chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
@@ -2377,3 +2497,9 @@ async def send_weixin_direct(
             "message_id": last_result.message_id if last_result else None,
             "context_token_used": bool(context_token),
         }
+
+
+
+
+
+

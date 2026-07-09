@@ -204,6 +204,17 @@ class MemoryStore:
             "user": self._render_block("user", sanitized_user),
         }
 
+        # Prefer summary file if recent (within 24h)
+        summary_path = mem_dir / "MEMORY_SUMMARY.md"
+        if summary_path.exists():
+            import time
+            age_seconds = time.time() - summary_path.stat().st_mtime
+            if age_seconds < 86400:
+                summary_text = summary_path.read_text(encoding="utf-8")
+                header = f"MEMORY (daily summary) [{len(summary_text):,} chars, {age_seconds/3600:.1f}h ago]"
+                separator = "═" * 46
+                self._system_prompt_snapshot["memory"] = f"{separator}\n{header}\n{separator}\n{summary_text}"
+
     @staticmethod
     def _sanitize_entries_for_snapshot(entries: List[str], filename: str) -> List[str]:
         """Return ``entries`` with any threat-matching entry replaced by a placeholder.
@@ -1146,6 +1157,7 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
+
 
 
 
