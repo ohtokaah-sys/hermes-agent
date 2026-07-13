@@ -209,12 +209,14 @@ class MemoryStore:
         # Prefer summary file if recent (within 24h)
         self._summary_snapshot_mtime = 0.0
         self._user_summary_snapshot_mtime = 0.0
+        self._memory_guard_mtime = 0.0  # YAML constraint guard application timestamp
         summary_path = mem_dir / "MEMORY_SUMMARY.md"
         if summary_path.exists():
             import time
             age_seconds = time.time() - summary_path.stat().st_mtime
             if age_seconds < 86400:
                 summary_text = summary_path.read_text(encoding="utf-8")
+                summary_text = self._apply_memory_constraint_guard(summary_text)
                 header = f"MEMORY (daily summary) [{len(summary_text):,} chars, {age_seconds/3600:.1f}h ago]"
                 separator = "═" * 46
                 self._system_prompt_snapshot["memory"] = f"{separator}\n{header}\n{separator}\n{summary_text}"
@@ -276,6 +278,18 @@ class MemoryStore:
             return  # Stale summary
 
         summary_text = summary_path.read_text(encoding="utf-8")
+        # READ-time constraint guard: independent YAML mtime tracking.
+        # Only re-scan when MEMORY_CONSTRAINTS.yaml is newer than our last
+        # guard application — avoids redundant string scans on every /new.
+        constraint_path = mem_dir / "MEMORY_CONSTRAINTS.yaml"
+        if constraint_path.exists():
+            constraint_mtime = constraint_path.stat().st_mtime
+            if constraint_mtime > self._memory_guard_mtime:
+                guarded = self._apply_memory_constraint_guard(summary_text)
+                if guarded != summary_text:
+                    summary_text = guarded
+                self._memory_guard_mtime = constraint_mtime
+
         header = f"MEMORY (daily summary) [{len(summary_text):,} chars, {age_seconds/3600:.1f}h ago]"
         separator = "═" * 46
         self._system_prompt_snapshot["memory"] = (
@@ -333,6 +347,81 @@ class MemoryStore:
             f"{separator}\n{header}\n{separator}\n{summary_text}"
         )
         self._user_summary_snapshot_mtime = user_summary_mtime
+
+    def _apply_memory_constraint_guard(self, summary_text: str) -> str:
+        """READ-time 机械兜底：MEMORY_CONSTRAINTS.yaml → 检查摘要覆盖 → 漏了的追加。
+
+        USER Phase 2 反哺：MEMORY 原只有 WRITE-time 守护（hook 生成摘要时）。
+        如果 hook 未触发（摘要未过期 + MEMORY.md 未更新 → hook 跳过），
+        约束文件修改后守护延后到下次 hook 触发。补 READ-time 第二层。
+
+        mtime 去重：解析摘要中的 HTML 时间戳 → 约束文件未更新则跳过。
+        """
+        mem_dir = get_memory_dir()
+        constraint_path = mem_dir / "MEMORY_CONSTRAINTS.yaml"
+        if not constraint_path.exists():
+            return summary_text
+
+        import re as _re
+        from datetime import datetime as _dt
+
+        # mtime 去重：约束文件未更新 → 跳过
+        m = _re.search(r'<!-- guard:mtime:(\S+) -->', summary_text)
+        if m:
+            try:
+                guard_ts = _dt.fromisoformat(m.group(1)).timestamp()
+                if constraint_path.stat().st_mtime <= guard_ts:
+                    return summary_text  # 约束未更新，跳过
+            except Exception:
+                pass  # 时间戳解析失败 → 跑守护（安全侧）
+
+        try:
+            data = yaml.safe_load(constraint_path.read_text(encoding="utf-8"))
+            constraints = data.get('constraints', [])
+        except Exception:
+            return summary_text  # YAML 损坏 → 降级
+
+        uncovered = []
+        for c in constraints:
+            try:
+                kws = c.get('keywords', [])
+                pts = c.get('patterns', [])
+                ft = c.get('full_text', '')
+                pri = c.get('priority', 'P2')
+                if any(kw in summary_text for kw in kws):
+                    continue
+                matched = False
+                for p in pts:
+                    if not p.strip():
+                        continue
+                    try:
+                        if _re.search(p, summary_text):
+                            matched = True
+                            break
+                    except _re.error:
+                        continue
+                if not matched:
+                    uncovered.append((pri, ft))
+            except Exception:
+                continue
+
+        if not uncovered:
+            return summary_text
+
+        priority_order = {'P0': 0, 'P1': 1, 'P2': 2}
+        uncovered.sort(key=lambda x: priority_order.get(x[0], 2))
+
+        guard_block = (
+            "\n\n---\n"
+            "## ⚠️ 机械兜底约束（Governance Decay Guard）\n"
+            "> 以下条目由 MEMORY_CONSTRAINTS.yaml 机械追加。\n"
+            "> 若与摘要中用户意图冲突，以摘要为准。\n"
+        )
+        for _, text in uncovered:
+            guard_block += f"\n- {text}"
+        guard_block += f"\n<!-- guard:mtime:{_dt.now().isoformat(timespec='seconds')} -->"
+
+        return summary_text + guard_block
 
     def _apply_user_constraint_guard(self, summary_text: str) -> str:
         """机械兜底：检查 USER_SUMMARY.md 是否覆盖 USER_CONSTRAINTS.yaml 所有条目。
@@ -1363,6 +1452,7 @@ def memory_tool(
     content: str = None,
     old_text: str = None,
     operations: Optional[List[Dict[str, Any]]] = None,
+    source: str = None,
     store: Optional[MemoryStore] = None,
 ) -> str:
     """
@@ -1395,6 +1485,12 @@ def memory_tool(
         if gate_result is not None:
             return gate_result
         result = store.apply_batch(target, operations)
+        if result.get("success") and target == "memory":
+            for op in operations:
+                op_action = op.get("action", "")
+                op_content = op.get("content", "")
+                if op_action == "add" and op_content:
+                    _update_memory_meta(op_content, op.get("source"))
         return json.dumps(result, ensure_ascii=False)
 
     # --- Single-op path ---------------------------------------------------
@@ -1422,9 +1518,13 @@ def memory_tool(
 
     if action == "add":
         result = store.add(target, content)
+        if result.get("success") and target == "memory":
+            _update_memory_meta(content, source)
 
     elif action == "replace":
         result = store.replace(target, old_text, content)
+        if result.get("success") and target == "memory":
+            _update_memory_meta(content, source)
 
     elif action == "remove":
         result = store.remove(target, old_text)
@@ -1460,6 +1560,7 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
         return store.apply_batch(target, payload.get("operations") or [])
     if action == "add":
         return store.add(target, content)
+        # Phase5b: meta handled by main handler
     if action == "replace":
         return store.replace(target, old_text, content)
     if action == "remove":
@@ -1513,6 +1614,11 @@ MEMORY_SCHEMA = {
                 "type": "string",
                 "description": "REQUIRED for 'replace' and 'remove' (single-op shape): a short unique substring identifying the existing entry to modify. Omit only for 'add'."
             },
+            "source": {
+                "type": "string",
+                "enum": ["user_stated", "llm_inferred"],
+                "description": "🆕 Source classification: user_stated = user explicitly said this (permanent TTL); llm_inferred = agent inference/extraction (90d TTL). Default: llm_inferred."
+            },
             "operations": {
                 "type": "array",
                 "description": (
@@ -1526,6 +1632,7 @@ MEMORY_SCHEMA = {
                         "action": {"type": "string", "enum": ["add", "replace", "remove"]},
                         "content": {"type": "string", "description": "Entry content for add/replace."},
                         "old_text": {"type": "string", "description": "Substring identifying the entry for replace/remove."},
+                        "source": {"type": "string", "enum": ["user_stated", "llm_inferred"], "description": "Source classification for this operation."},
                     },
                     "required": ["action"],
                 },
@@ -1544,6 +1651,7 @@ registry.register(
     toolset="memory",
     schema=MEMORY_SCHEMA,
     handler=lambda args, **kw: memory_tool(
+        source=args.get("source"),
         action=args.get("action", ""),
         target=args.get("target", "memory"),
         content=args.get("content"),
@@ -1558,3 +1666,29 @@ registry.register(
 
 
 
+# Source-graded memory meta
+
+def _update_memory_meta(content: str, source: str = None):
+    """Write entry hash + source to memory_meta.json. External to MEMORY.md."""
+    import json, hashlib
+    from pathlib import Path
+    meta_path = Path.home() / ".hermes" / "state" / "memory_meta.json"
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta = {}
+    if meta_path.exists():
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            meta = {}
+    entry_hash = hashlib.sha256(content.encode()).hexdigest()[:12]
+    if "entries" not in meta:
+        meta["entries"] = {}
+    meta["entries"][entry_hash] = {
+        "hash": entry_hash,
+        "source": source or "llm_inferred",
+        "created_at": __import__("datetime").datetime.now().isoformat(),
+    }
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+>>>>>>> 6c78706b2 (feat(memory): source-graded memory meta)
