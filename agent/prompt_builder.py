@@ -1801,9 +1801,17 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
     except Exception as e:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
 
-    soul_path = get_hermes_home() / "SOUL.md"
+    # Try compressed version first, fall back to full version
+    soul_path = get_hermes_home() / "memories" / "SOUL.md"
     if not soul_path.exists():
-        return None
+        soul_path = get_hermes_home() / "SOUL.md"
+        if not soul_path.exists():
+            return None
+        logger.warning(
+            "Compressed SOUL.md not found at %s, falling back to full SOUL.md (%d bytes)",
+            get_hermes_home() / "memories" / "SOUL.md",
+            soul_path.stat().st_size,
+        )
     try:
         content = soul_path.read_text(encoding="utf-8").strip()
         if not content:
