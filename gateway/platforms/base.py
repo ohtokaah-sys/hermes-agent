@@ -3078,6 +3078,20 @@ class BasePlatformAdapter(ABC):
         cleaned = content
         for pattern in (md_pattern, html_pattern):
             cleaned = re.sub(pattern, _remove_if_extracted, cleaned)
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+
+        # 本地独有：MEDIA 未识别扩展名警告
+        unrecognized = re.findall(r'MEDIA:\s*\S+', cleaned)
+        for u in unrecognized:
+            logger.warning("Unrecognized MEDIA extension (not in whitelist): %s", u[:120])
+
+        return images, cleaned
+        def _remove_if_extracted(match):
+            url = match.group(2) if match.lastindex >= 2 else match.group(1)
+            return '' if url in extracted_urls else match.group(0)
+        cleaned = content
+        for pattern in (md_pattern, html_pattern):
+            cleaned = re.sub(pattern, _remove_if_extracted, cleaned)
         return images, re.sub(r'\n{3,}', '\n\n', cleaned).strip()  # leftover blank lines
 
     async def send_voice(
@@ -3258,11 +3272,20 @@ class BasePlatformAdapter(ABC):
     @staticmethod
     def filter_media_delivery_paths(media_files, session_key: str = "",
                                     dropped: Optional[list[dict]] = None) -> list[tuple[str, bool]]:
-        """Drop unsafe MEDIA paths and normalize accepted paths; ``dropped`` collects the rejects."""
-        return [
-            (safe_path, bool(is_voice)) for media_path, is_voice in media_files or []
-            if (safe_path := _validated_delivery_path(media_path, session_key, "MEDIA directive path", dropped))]
-
+        """Drop unsafe MEDIA paths and normalize accepted paths; ``dropped`` collects the rejects.
+        Deduplicates by resolved path to prevent double-delivery (P052)."""
+        safe_media: List[Tuple[str, bool]] = []
+        seen = set()
+        for media_path, is_voice in media_files or []:
+            safe_path = _validated_delivery_path(media_path, session_key, "MEDIA directive path", dropped)
+            if not safe_path:
+                continue
+            if safe_path in seen:
+                logger.info("Skipping duplicate MEDIA path: %s", _log_safe_path(safe_path))
+                continue
+            seen.add(safe_path)
+            safe_media.append((safe_path, bool(is_voice)))
+        return safe_media
     @staticmethod
     def filter_local_delivery_paths(file_paths, session_key: str = "") -> list[str]:
         """Drop unsafe bare local file paths and normalize accepted paths."""
@@ -3350,7 +3373,9 @@ class BasePlatformAdapter(ABC):
         if media:
             spans = _deliverable_tag_spans(cleaned)
             if spans:
+
                 cleaned = re.sub(r'\n{3,}', '\n\n', _delete_spans(cleaned, spans)).strip()
+
         return media, cleaned
 
     @staticmethod

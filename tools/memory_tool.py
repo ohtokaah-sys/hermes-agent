@@ -172,7 +172,6 @@ _REPLACE_REMOVED = ("'replace' is not available; use 'patch'. old_text is the ex
                     "content is its new text; the rest of the entry is kept. To rewrite a whole entry, "
                     "set old_text to the whole entry. Nothing was written.")
 
-
 def destructive_ops(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """The replace/remove ops of a staged memory payload, single-op or batch shape."""
     ops = (payload.get("operations") or []) if payload.get("action") == "batch" else [payload]
@@ -346,8 +345,7 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store,
             from memory_routing import check_route
             route = check_route(content, target)
             if route.get("action") == "block":
-                return _applied({
-                    "success": False,
+                return _applied({                    "success": False,
                     "status": "routed_to_kaah",
                     "message": "事件类记忆已自动转存 kaah 归档（不占常驻 MEMORY）",
                     "archive_path": route.get("archive_path", ""),
@@ -357,8 +355,7 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store,
             elif route.get("action") == "write_with_warning":
                 content = "⚠️未分类 " + content
         except Exception:
-            pass  # 分流模块失败 → fail open，不阻断记忆写入
-    result = _STORE_ACTIONS[action][0](store, target, content, old_text)
+            pass  # 分流模块失败 → fail open，不阻断记忆写入    result = _STORE_ACTIONS[action][0](store, target, content, old_text)
     if target == "memory" and isinstance(result, dict) and result.get("success"):
         if action in ("add", "replace"):
             _record_memory_meta(content)
@@ -677,6 +674,41 @@ def _archive_expired_entry(entry_hash: str, entry_meta: dict, age_days=None) -> 
         logger.debug("archive meta update failed", exc_info=True)
 
     return str(archive_path)
+
+
+def _parse_ttl(ttl_str: str):
+    """解析 TTL 字符串 -> 天数（None = permanent）"""
+    import re as _re
+    if ttl_str in ("permanent", None):
+        return None
+    match = _re.match(r'^(\d+)d$', str(ttl_str))
+    if match:
+        return int(match.group(1))
+    return 14
+
+
+def _memory_source_stats_hint() -> str:
+    """2026-08-11 CI 白鳝方法论2: 统计 memory_meta.json 中 source 分布，返回注入提示。
+
+    纯知情不改行为：让 Agent/用户看到摘要时知道哪些条目是 AI 推断。
+    失败降级返回空串（不阻塞注入）。
+    """
+    try:
+        import json as _json
+        meta_path = get_hermes_home() / "state" / "memory_meta.json"
+        if not meta_path.exists():
+            return ""
+        with open(meta_path, encoding="utf-8") as _f:
+            meta = _json.load(_f)
+        entries = meta.get("entries", {})
+        if not entries:
+            return ""
+        user_cnt = sum(1 for v in entries.values() if v.get("source") == "user_stated")
+        llm_cnt = sum(1 for v in entries.values() if v.get("source") == "llm_inferred")
+        total = len(entries)
+        return f"⚠️ {total}条记忆中 {llm_cnt}条为AI推断(llm_inferred)，{user_cnt}条为你陈述(user_stated)——引用推断条目需核实"
+    except Exception:
+        return ""
 
 
 def _calc_effective_ttl(entry_meta: dict):

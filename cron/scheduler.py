@@ -543,6 +543,7 @@ def _cron_failure_marker_error(text: str) -> Optional[str]:
     return evidence or "Cron agent reported failure."
 
 
+
 def _is_cron_silence_response(text: str) -> bool:
     """True when a cron final response should suppress delivery: ``[SILENT]`` (or SILENT /
     NO_REPLY / NO REPLY) as the whole response OR its own first/last line — NOT mid-sentence.
@@ -3404,9 +3405,11 @@ def _run_one_job_body(
         # raise anywhere still tears the deferred agent down.
         d = _RunDelivery(job=job, success=success, error=error, agent_declared=agent_declared)
         try:
+
             _save_compose_deliver(
                 d, fence, final_response, output, adapters=adapters, loop=loop, verbose=verbose,
                 execution_token=execution_token)
+
         except _FireClaimLostDuringSideEffect:
             d.side_effect_ownership_lost = True
         finally:

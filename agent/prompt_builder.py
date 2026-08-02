@@ -1661,7 +1661,13 @@ def load_soul_md(context_length: Optional[int] = None, home_override: Path | Non
         ensure_hermes_home()
     except Exception as e:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
-    soul_path = (Path(home_override) if home_override is not None else get_hermes_home()) / "SOUL.md"
+
+
+    _home = Path(home_override) if home_override is not None else get_hermes_home()
+    # ── SOUL 渐进式披露：优先加载压缩版 memories/SOUL.md，回退到完整版 ──
+    compact_path = _home / "memories" / "SOUL.md"
+    soul_path = compact_path if compact_path.exists() else _home / "SOUL.md"
+
     if not soul_path.exists():
         return None
     try:

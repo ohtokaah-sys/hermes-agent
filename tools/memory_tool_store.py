@@ -14,6 +14,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from utils import atomic_write_text
 from tools.threat_patterns import first_threat_message as _first_threat_message
+# 渐进式披露：本地定制移植所需依赖
+import os
+import yaml
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger("tools.memory_tool")
 
@@ -191,6 +195,13 @@ class MemoryStore:
         self.memory_enabled, self.user_profile_enabled = memory_enabled, user_profile_enabled
         self._system_prompt_snapshot: dict[str, str] = {"memory": "", "user": ""}
         self._consolidation_failures = 0  # per turn; reset by reset_consolidation_failures()
+        # ── 渐进式披露 mtime 字段（移植自本地） ──
+        self._summary_snapshot_mtime = 0.0
+        self._user_summary_snapshot_mtime = 0.0
+        self._memory_guard_mtime = 0.0
+        # §5.4 成本监控：session 唯一标识
+        import uuid as _uuid
+        self._cost_sid = _uuid.uuid4().hex[:8]
 
     # Per-turn counter of failed at-capacity consolidation attempts; reset at each turn boundary by
     # reset_consolidation_failures() (#42405).
@@ -251,6 +262,52 @@ class MemoryStore:
                                "further additions are blocked until it is back under the limit.",
                                path.name, count, limit)
             self._system_prompt_snapshot[target] = self._render_block(target, [_sanitize(e, path.name) for e in entries])
+        # MEMORY_SUMMARY.md 优先注入：摘要存在且在 24h 内 → 用 ~5K 替代 ~100K 全量
+        from tools import memory_tool
+        mem_dir = memory_tool.get_memory_dir()
+        summary_path = mem_dir / "MEMORY_SUMMARY.md"
+
+        # ── 分层索引 v2 灰度开关 ──
+        _flag_path = mem_dir.parent / "state" / "flags" / "lean_index_v2"
+        _v2_path = mem_dir / "MEMORY_SUMMARY_V2.md"
+        if _flag_path.exists() and _v2_path.exists():
+            summary_path = _v2_path
+
+        if summary_path.exists():
+            import time
+            age_seconds = time.time() - summary_path.stat().st_mtime
+            if age_seconds < 86400:
+                summary_text = summary_path.read_text(encoding="utf-8")
+                summary_text = self._apply_memory_constraint_guard(summary_text)
+                header = f"MEMORY (daily summary) [{len(summary_text):,} chars, {age_seconds/3600:.1f}h ago]"
+                _src_hint = _memory_source_stats_hint()
+                if _src_hint:
+                    header += " | " + _src_hint
+                separator = "═" * 46
+                self._system_prompt_snapshot["memory"] = f"{separator}\n{header}\n{separator}\n{summary_text}"
+                self._summary_snapshot_mtime = summary_path.stat().st_mtime
+                from tools.memory_tool import _cost_record
+                _cost_record(self._cost_sid, "lean_chars", len(summary_text))
+
+        # USER_SUMMARY.md 优先注入（与 MEMORY 摘要重定向对称设计，Phase 2 USER 渐进式披露）
+        user_summary_path = mem_dir / "USER_SUMMARY.md"
+        if user_summary_path.exists():
+            import time
+            age_seconds = time.time() - user_summary_path.stat().st_mtime
+            if age_seconds < 86400:
+                summary_text = user_summary_path.read_text(encoding="utf-8")
+                summary_text = self._apply_user_constraint_guard(summary_text)
+                header = f"USER PROFILE (summary) [{len(summary_text):,} chars, {age_seconds/3600:.1f}h ago]"
+                separator = "═" * 46
+                self._system_prompt_snapshot["user"] = f"{separator}\n{header}\n{separator}\n{summary_text}"
+                self._user_summary_snapshot_mtime = user_summary_path.stat().st_mtime
+                from tools.memory_tool import _cost_record
+                _cost_record(self._cost_sid, "user_chars", len(summary_text))
+            else:
+                logger.warning(
+                    "USER_SUMMARY.md is stale (%.1fh old), falling back to full USER.md",
+                    age_seconds / 3600,
+                )
 
     @staticmethod
     @contextmanager
@@ -616,9 +673,484 @@ class MemoryStore:
         return self._mutate(target, _apply, skip_drift=not commit)
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
-        """Frozen load-time snapshot (NOT live state — mid-session writes don't touch
-        it, preserving the prefix cache); None if empty."""
-        return self._system_prompt_snapshot.get(target, "") or None
+        """
+        Return the frozen snapshot for system prompt injection.
+
+        This returns the state captured at load_from_disk() time, NOT the live
+        state. Mid-session writes do not affect this. This keeps the system
+        prompt stable across all turns, preserving the prefix cache.
+
+        Returns None if the snapshot is empty (no entries at load time).
+
+        For target="memory", lazily refreshes MEMORY_SUMMARY.md if a newer
+        version exists on disk (e.g. cron regenerated it after gateway start).
+        The refresh only fires on mtime change, so steady-state conversations
+        keep a cache-stable prompt.
+        """
+        if target == "memory":
+            self._refresh_memory_summary()
+        elif target == "user":
+            self._refresh_user_summary()
+        block = self._system_prompt_snapshot.get(target, "")
+        return block if block else None
+
+    def _refresh_memory_summary(self):
+        """Re-read MEMORY_SUMMARY.md into the system prompt snapshot if newer.
+
+        Called from format_for_system_prompt() on every new conversation
+        (system prompt build).  If MEMORY.md is newer than the summary,
+        regenerates it on the spot (DS V3, ~2-3s) so the current
+        conversation always gets a fresh summary.  In the steady state
+        this is a single stat(2) check and returns immediately, preserving
+        prefix-cache stability across turns.
+        """
+        from tools import memory_tool
+        mem_dir = memory_tool.get_memory_dir()
+        summary_path = mem_dir / "MEMORY_SUMMARY.md"
+
+        # ── 分层索引 v2 灰度开关 ──
+        _flag_path = mem_dir.parent / "state" / "flags" / "lean_index_v2"
+        _v2_path = mem_dir / "MEMORY_SUMMARY_V2.md"
+        if _flag_path.exists() and _v2_path.exists():
+            summary_path = _v2_path
+
+        memory_path = mem_dir / "MEMORY.md"
+
+        import time
+
+        # ── 当场刷新：MEMORY.md 比摘要新 → 重新生成 ──
+        if memory_path.exists():
+            memory_mtime = memory_path.stat().st_mtime
+            summary_mtime = summary_path.stat().st_mtime if summary_path.exists() else 0.0
+            if memory_mtime > summary_mtime:
+                self._generate_summary_on_demand(memory_path, summary_path)
+
+        if not summary_path.exists():
+            return
+
+        summary_mtime = summary_path.stat().st_mtime
+        if summary_mtime <= self._summary_snapshot_mtime:
+            return  # No change since last load
+
+        age_seconds = time.time() - summary_mtime
+        if age_seconds >= 86400:
+            return  # Stale summary
+
+        summary_text = summary_path.read_text(encoding="utf-8")
+        # READ-time constraint guard: independent YAML mtime tracking.
+        # Only re-scan when MEMORY_CONSTRAINTS.yaml is newer than our last
+        # guard application — avoids redundant string scans on every /new.
+        constraint_path = mem_dir / "MEMORY_CONSTRAINTS.yaml"
+        if constraint_path.exists():
+            constraint_mtime = constraint_path.stat().st_mtime
+            if constraint_mtime > self._memory_guard_mtime:
+                guarded = self._apply_memory_constraint_guard(summary_text)
+                if guarded != summary_text:
+                    summary_text = guarded
+                self._memory_guard_mtime = constraint_mtime
+
+        header = f"MEMORY (daily summary) [{len(summary_text):,} chars, {age_seconds/3600:.1f}h ago]"
+        separator = "═" * 46
+        self._system_prompt_snapshot["memory"] = (
+            f"{separator}\n{header}\n{separator}\n{summary_text}"
+        )
+        self._summary_snapshot_mtime = summary_mtime
+
+    def _refresh_user_summary(self):
+        """Re-read USER_SUMMARY.md into the system prompt snapshot if newer.
+
+        Called from format_for_system_prompt() on every new conversation.
+        If USER.md is newer than USER_SUMMARY.md, regenerates it on the
+        spot (DS V3, ~2-3s) so the current conversation always gets a
+        fresh summary.  In the steady state this is a single stat(2)
+        check and returns immediately, preserving prefix-cache stability
+        across turns.
+
+        Applies _apply_user_constraint_guard() to mechanically ensure all
+        USER_CONSTRAINTS.yaml entries are covered in the injected prompt.
+        """
+        from tools import memory_tool
+        mem_dir = memory_tool.get_memory_dir()
+        user_summary_path = mem_dir / "USER_SUMMARY.md"
+        user_path = mem_dir / "USER.md"
+
+        import time
+
+        # ── 当场刷新：USER.md 比摘要新 → 重新生成 ──
+        if user_path.exists():
+            user_mtime = user_path.stat().st_mtime
+            summary_mtime = (
+                user_summary_path.stat().st_mtime
+                if user_summary_path.exists()
+                else 0.0
+            )
+            if user_mtime > summary_mtime:
+                self._generate_user_summary_on_demand(user_path, user_summary_path)
+
+        if not user_summary_path.exists():
+            return
+
+        user_summary_mtime = user_summary_path.stat().st_mtime
+        if user_summary_mtime <= self._user_summary_snapshot_mtime:
+            return  # No change since last load
+
+        age_seconds = time.time() - user_summary_mtime
+        if age_seconds >= 86400:
+            return  # Stale summary — fall back to full USER.md
+
+        summary_text = user_summary_path.read_text(encoding="utf-8")
+        # READ-time 约束守护：每次加载摘要时检查 YAML 约束覆盖，追加未覆盖条目
+        summary_text = self._apply_user_constraint_guard(summary_text)
+        header = f"USER PROFILE (summary) [{len(summary_text):,} chars, {age_seconds/3600:.1f}h ago]"
+        separator = "═" * 46
+        self._system_prompt_snapshot["user"] = (
+            f"{separator}\n{header}\n{separator}\n{summary_text}"
+        )
+        self._user_summary_snapshot_mtime = user_summary_mtime
+
+    def _apply_memory_constraint_guard(self, summary_text: str) -> str:
+        """READ-time 机械兜底：MEMORY_CONSTRAINTS.yaml → 检查摘要覆盖 → 漏了的追加。
+
+        USER Phase 2 反哺：MEMORY 原只有 WRITE-time 守护（hook 生成摘要时）。
+        如果 hook 未触发（摘要未过期 + MEMORY.md 未更新 → hook 跳过），
+        约束文件修改后守护延后到下次 hook 触发。补 READ-time 第二层。
+
+        mtime 去重：解析摘要中的 HTML 时间戳 → 约束文件未更新则跳过。
+        """
+        from tools import memory_tool
+        mem_dir = memory_tool.get_memory_dir()
+        constraint_path = mem_dir / "MEMORY_CONSTRAINTS.yaml"
+        if not constraint_path.exists():
+            return summary_text
+
+        import re as _re
+        from datetime import datetime as _dt
+
+        # mtime 去重：约束文件未更新 → 跳过
+        m = _re.search(r'<!-- guard:mtime:(\S+) -->', summary_text)
+        if m:
+            try:
+                guard_ts = _dt.fromisoformat(m.group(1)).timestamp()
+                if constraint_path.stat().st_mtime <= guard_ts:
+                    return summary_text  # 约束未更新，跳过
+            except Exception:
+                pass  # 时间戳解析失败 → 跑守护（安全侧）
+
+        try:
+            data = yaml.safe_load(constraint_path.read_text(encoding="utf-8"))
+            constraints = data.get('constraints', [])
+        except Exception:
+            return summary_text  # YAML 损坏 → 降级
+
+        uncovered = []
+        for c in constraints:
+            try:
+                kws = c.get('keywords', [])
+                pts = c.get('patterns', [])
+                ft = c.get('full_text', '')
+                pri = c.get('priority', 'P2')
+                if any(kw in summary_text for kw in kws):
+                    continue
+                matched = False
+                for p in pts:
+                    if not p.strip():
+                        continue
+                    try:
+                        if _re.search(p, summary_text):
+                            matched = True
+                            break
+                    except _re.error:
+                        continue
+                if not matched:
+                    uncovered.append((pri, ft))
+            except Exception:
+                continue
+
+        if not uncovered:
+            return summary_text
+
+        priority_order = {'P0': 0, 'P1': 1, 'P2': 2}
+        uncovered.sort(key=lambda x: priority_order.get(x[0], 2))
+
+        guard_block = (
+            "\n\n---\n"
+            "## ⚠️ 机械兜底约束（Governance Decay Guard）\n"
+            "> 以下条目由 MEMORY_CONSTRAINTS.yaml 机械追加。\n"
+            "> 若与摘要中用户意图冲突，以摘要为准。\n"
+        )
+        for _, text in uncovered:
+            guard_block += f"\n- {text}"
+        guard_block += f"\n<!-- guard:mtime:{_dt.now().isoformat(timespec='seconds')} -->"
+
+        return summary_text + guard_block
+
+    def _apply_user_constraint_guard(self, summary_text: str) -> str:
+        """机械兜底：检查 USER_SUMMARY.md 是否覆盖 USER_CONSTRAINTS.yaml 所有条目。
+
+        YAML 解析失败 → 降级返回原文（不阻塞注入）。
+        单条约束损坏 → skip 该条，继续处理其余。
+        未覆盖条目按 priority 降序（P0 在前）追加到摘要末尾。
+        约束追加块加注释：若与摘要中用户意图冲突，以摘要为准。
+
+        READ-time 设计（非 WRITE-time）：USER 摘要手动维护，无 hook 生成路径，
+        守护在每次 /new 加载摘要时执行。
+        """
+        from tools import memory_tool
+        mem_dir = memory_tool.get_memory_dir()
+        constraint_path = mem_dir / "USER_CONSTRAINTS.yaml"
+        if not constraint_path.exists():
+            return summary_text
+
+        try:
+            data = yaml.safe_load(constraint_path.read_text(encoding="utf-8"))
+            constraints = data.get('constraints', [])
+        except Exception:
+            return summary_text  # YAML 损坏时降级——不阻塞注入
+
+        uncovered = []
+        for c in constraints:
+            try:
+                keywords = c.get('keywords', [])
+                full_text = c.get('full_text', '')
+                priority = c.get('priority', 'P2')
+                if not any(kw in summary_text for kw in keywords):
+                    uncovered.append((priority, full_text))
+            except Exception:
+                continue  # 单条损坏不影响其余
+
+        if not uncovered:
+            return summary_text
+
+        priority_order = {'P0': 0, 'P1': 1, 'P2': 2}
+        uncovered.sort(key=lambda x: priority_order.get(x[0], 2))
+
+        guard_block = (
+            "\n\n---\n"
+            "## ⚠️ 机械兜底约束\n"
+            "> 以下条目由 USER_CONSTRAINTS.yaml 机械追加。\n"
+            "> 若与摘要中用户意图冲突，以摘要为准。\n"
+        )
+        for _, text in uncovered:
+            guard_block += f"\n- {text}"
+
+        return summary_text + guard_block
+
+    def _generate_summary_on_demand(self, memory_path, summary_path):
+        """Regenerate MEMORY_SUMMARY.md from MEMORY.md using DeepSeek V3.
+
+        Called from _refresh_memory_summary() when MEMORY.md mtime is
+        newer than the cached summary — the current /new conversation
+        should not wait for a cron or hook to catch up.
+        """
+        import json as _json
+        import re as _re
+        import urllib.request as _urllib
+
+        memory_text = memory_path.read_text(encoding="utf-8")
+        if len(memory_text) < 100:
+            return
+
+        # ── API key ──
+        ds_key_file = os.path.expanduser("~/.hermes/.deepseek_key")
+        if not os.path.exists(ds_key_file):
+            logger.warning("_generate_summary_on_demand: no DeepSeek key")
+            return
+        ds_key = Path(ds_key_file).read_text(encoding="utf-8").strip()
+
+        prompt = (
+            "将以下 MEMORY.md 压缩为 3-5K chars 的分层索引。\n"
+            "MEMORY.md 原文：\n"
+            + memory_text +
+            "\n\n按以下格式输出（不要加额外说明）：\n"
+            "> ⚠️ 以下为分层索引摘要。每条目含核心事实+元数据。\n"
+            "> 需要完整上下文时，必须调用 memory(action='read') 获取原文。\n"
+            "> ⛔ 违反本指令将被实时监控——多次违规累计后 session 将被自动终止。\n"
+            "> 禁止基于摘要片段做出判断或声称——复述摘要也视为违反。\n\n"
+            "## 索引\n"
+            "| # | 类别 | 条目 | Token | 核心事实 | 关键词 |\n"
+            "|:--|:--|:--|:--|:--|:--|\n"
+            "(每行一条记忆类别。token 估算：~4 chars = 1 token。\n"
+            "核心事实列每格 10-30 字——只写最关键的一句话事实，不可省略。\n"
+            "活跃项目/30天新决策→正常列入。长期稳定偏好→压缩为一句核心事实。\n"
+            "已完成项目→只列标题。纯操作日志/已解决技术债→不列入。)\n"
+            "**总计**: N类 M条目 ~XK chars, ~Y tokens\n\n"
+            "⚠️ 格式铁律：输出必须恰好是指定格式——4行头部→空行→\"## 索引\"→表格→\"**总计**\"——之后立即停止，不要任何额外内容、解释、注释。超过 6K chars 的输出将被截断丢弃。"
+        )
+
+        payload = _json.dumps({
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 384000,
+        }).encode()
+
+        try:
+            req = _urllib.Request(
+                "https://api.deepseek.com/v1/chat/completions",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {ds_key}",
+                },
+            )
+            resp = _json.loads(_urllib.urlopen(req, timeout=60).read())
+            summary = resp["choices"][0]["message"]["content"].strip()
+            # Strip markdown code block wrappers（对称 USER 摘要生成行 691-695）
+            if summary.startswith("```"):
+                summary = summary.split("\n", 1)[-1]
+            if summary.endswith("```"):
+                summary = summary.rsplit("\n", 1)[0]
+            summary = summary.strip()
+        except Exception:
+            logger.warning(
+                "_generate_summary_on_demand: API call failed", exc_info=True
+            )
+            return
+
+        if not summary:
+            return
+
+        # ── Governance Decay Guard — 机械兜底约束 ──
+        constraints_path = os.path.expanduser(
+            "~/.hermes/memories/MEMORY_CONSTRAINTS.yaml"
+        )
+        if os.path.exists(constraints_path):
+            appended = []
+            try:
+                with open(constraints_path, encoding="utf-8") as f:
+                    _constraints_data = yaml.safe_load(f)
+                _constraints = (
+                    _constraints_data.get("constraints", [])
+                    if isinstance(_constraints_data, dict)
+                    else []
+                )
+            except Exception:
+                _constraints = []  # YAML 损坏 → 降级（不附加，不炸系统）
+            for _c in _constraints:
+                if not isinstance(_c, dict):
+                    continue
+                _ft = _c.get("full_text", "")
+                if not _ft:
+                    continue
+                _hit = False
+                for _p in _c.get("patterns", []):
+                    if not isinstance(_p, str) or not _p.strip():
+                        continue
+                    try:
+                        if _re.search(_p, summary):
+                            _hit = True
+                            break
+                    except _re.error:
+                        continue  # 单个坏 pattern → 跳过该条，不拖垮系统
+                if not _hit:
+                    appended.append(_ft)
+            if appended:
+                guard = "## ⚠️ 机械兜底约束（Governance Decay Guard）\n"
+                guard += "\n".join(appended)
+                summary = guard + "\n\n" + summary
+
+        summary_path.write_text(summary, encoding="utf-8")
+        logger.info(
+            "_generate_summary_on_demand: regenerated (%d chars)", len(summary)
+        )
+
+    def _generate_user_summary_on_demand(self, user_path, summary_path):
+        """Regenerate USER_SUMMARY.md from USER.md using DeepSeek V3.
+
+        Called from _refresh_user_summary() when USER.md mtime is
+        newer than the summary — the current /new conversation
+        should not wait for manual maintenance to catch up.
+
+        Symmetric to _generate_summary_on_demand() for MEMORY.
+        """
+        import json as _json
+        import urllib.request as _urllib
+
+        user_text = user_path.read_text(encoding="utf-8")
+        if len(user_text) < 100:
+            return
+
+        # ── API key ──
+        ds_key_file = os.path.expanduser("~/.hermes/.deepseek_key")
+        if not os.path.exists(ds_key_file):
+            logger.warning("_generate_user_summary_on_demand: no DeepSeek key")
+            return
+        ds_key = Path(ds_key_file).read_text(encoding="utf-8").strip()
+
+        # ── Read existing summary as style reference ──
+        existing_summary = ""
+        if summary_path.exists():
+            existing_summary = summary_path.read_text(encoding="utf-8")
+
+        prompt = (
+            "将以下 USER.md 压缩为 3KB 以内的结构化摘要。\n"
+            "保留所有核心行为偏好，按 8 组分类：\n"
+            "行为底线、分析方法、交互节奏、设计原则、\n"
+            "执行节奏、沟通与授权、输出标准、架构与护栏。\n"
+            "丢弃：已过时的项目状态、特定日期事件、家人微信备注等个人细节。\n"
+            "每条偏好一行，格式：'- 偏好名——简短说明'。\n\n"
+        )
+        if existing_summary:
+            prompt += (
+                "当前摘要（作格式参考，内容可能过时——请根据 USER.md 原文重新生成）：\n"
+                + existing_summary[:2000]
+                + "\n\n"
+            )
+        prompt += (
+            "USER.md 原文：\n"
+            + user_text
+            + "\n\n"
+            "按以下格式输出（不要加额外说明，不要用代码块包裹）：\n"
+            "# USER.md 摘要 — 渐进式披露\n\n"
+            "> 完整 USER.md 通过 memory(action='read', target='user') 获取。\n"
+            "> 以下核心偏好按 8 组排列。完整约束见 USER_CONSTRAINTS.yaml。\n\n"
+            "## 行为底线\n"
+            "## 分析方法\n"
+            "## 交互节奏\n"
+            "## 设计原则\n"
+            "## 执行节奏\n"
+            "## 沟通与授权\n"
+            "## 输出标准\n"
+            "## 架构与护栏\n"
+        )
+
+        payload = _json.dumps({
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 384000,
+        }).encode()
+
+        try:
+            req = _urllib.Request(
+                "https://api.deepseek.com/v1/chat/completions",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {ds_key}",
+                },
+            )
+            resp = _json.loads(_urllib.urlopen(req, timeout=60).read())
+            summary = resp["choices"][0]["message"]["content"].strip()
+        except Exception:
+            logger.warning(
+                "_generate_user_summary_on_demand: API call failed", exc_info=True
+            )
+            return
+
+        if not summary:
+            return
+
+        # ── Strip code block markers if LLM wrapped output ──
+        if summary.startswith("```"):
+            summary = summary.split("\n", 1)[-1]
+        if summary.endswith("```"):
+            summary = summary.rsplit("\n", 1)[0]
+
+        summary_path.write_text(summary, encoding="utf-8")
+        logger.info(
+            "_generate_user_summary_on_demand: regenerated (%d chars)", len(summary)
+        )
 
     def _success_response(self, target: str, message: str | None = None, **extra) -> dict[str, Any]:
         """TERMINAL and WITHOUT the entries list: echoing entries invites the model to
@@ -698,3 +1230,26 @@ class MemoryStore:
         except OSError:
             return str(bak_path) + " (BACKUP FAILED — file unchanged on disk)"
         return str(bak_path)
+
+def _memory_source_stats_hint() -> str:
+    """2026-08-11 CI 白鳝方法论2: 统计 memory_meta.json 中 source 分布，返回注入提示。
+
+    纯知情不改行为：让 Agent/用户看到摘要时知道哪些条目是 AI 推断。
+    失败降级返回空串（不阻塞注入）。
+    """
+    try:
+        import json as _json
+        meta_path = get_hermes_home() / "state" / "memory_meta.json"
+        if not meta_path.exists():
+            return ""
+        with open(meta_path, encoding="utf-8") as _f:
+            meta = _json.load(_f)
+        entries = meta.get("entries", {})
+        if not entries:
+            return ""
+        user_cnt = sum(1 for v in entries.values() if v.get("source") == "user_stated")
+        llm_cnt = sum(1 for v in entries.values() if v.get("source") == "llm_inferred")
+        total = len(entries)
+        return f"⚠️ {total}条记忆中 {llm_cnt}条为AI推断(llm_inferred)，{user_cnt}条为你陈述(user_stated)——引用推断条目需核实"
+    except Exception:
+        return ""

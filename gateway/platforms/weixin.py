@@ -124,7 +124,105 @@ def _make_ssl_connector() -> Optional[aiohttp.TCPConnector]:
 def _new_session(**kwargs: Any) -> aiohttp.ClientSession:
     return aiohttp.ClientSession(trust_env=gateway_trust_env(), connector=_make_ssl_connector(), **kwargs)
 
+# ── 引用消息缓存（持久化，重启不丢）──
+from collections import OrderedDict as _OrderedDict
+_MAX_MSG_CACHE_SIZE = 500
+_msg_text_cache: "_OrderedDict[str, str]" = _OrderedDict()
 
+# 持久化缓存：SQLite，存 msg_id→text，重启不丢
+import sqlite3 as _sqlite3
+import threading as _threading
+_ref_db_path = str(Path(get_hermes_home()) / "state" / "ref_cache.db")
+_ref_db_lock = _threading.Lock()
+
+def _init_ref_db() -> None:
+    with _ref_db_lock:
+        db = _sqlite3.connect(_ref_db_path)
+        db.execute("CREATE TABLE IF NOT EXISTS cache (msg_id TEXT PRIMARY KEY, text TEXT, ts INTEGER)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_ts ON cache(ts)")
+        db.commit()
+        db.close()
+
+def _persist_ref_cache(msg_id: str, text: str) -> None:
+    with _ref_db_lock:
+        db = _sqlite3.connect(_ref_db_path)
+        db.execute("INSERT OR REPLACE INTO cache VALUES (?, ?, ?)",
+                   (msg_id, text, int(__import__('time').time())))
+        db.execute("DELETE FROM cache WHERE msg_id NOT IN (SELECT msg_id FROM cache ORDER BY ts DESC LIMIT 500)")
+        db.commit()
+        db.close()
+
+def _query_ref_cache(msg_id: str) -> "str | None":
+    with _ref_db_lock:
+        db = _sqlite3.connect(_ref_db_path)
+        row = db.execute("SELECT text FROM cache WHERE msg_id=?", (msg_id,)).fetchone()
+        db.close()
+    return row[0] if row else None
+
+_init_ref_db()
+
+def _cache_message_text(msg_id: str, text: str) -> None:
+    _msg_text_cache[msg_id] = text
+    _msg_text_cache.move_to_end(msg_id)
+    while len(_msg_text_cache) > _MAX_MSG_CACHE_SIZE:
+        _msg_text_cache.popitem(last=False)
+    _persist_ref_cache(msg_id, text)
+
+# 出站消息时间队列：iLink send 响应不含 msg_id，用时间戳近似匹配
+# v2 (2026-07-30): 持久化到 JSONL，重启不丢
+_MAX_OUTBOUND_QUEUE = 50
+_outbound_queue: "list[tuple[int, str]]" = []
+_outbound_cache_path = str(Path(get_hermes_home()) / "state" / "outbound_queue.jsonl")
+
+def _record_outbound(text: str) -> None:
+    import time as _time
+    ts = int(_time.time() * 1000)
+    _outbound_queue.append((ts, text))
+    while len(_outbound_queue) > _MAX_OUTBOUND_QUEUE:
+        _outbound_queue.pop(0)
+    try:
+        import json as _json
+        with open(_outbound_cache_path, 'a') as f:
+            f.write(_json.dumps({"ts": ts, "text": text[:500]}, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+def _lookup_outbound(ref_time_ms: int) -> "str | None":
+    best = None
+    for ts, txt in _outbound_queue:
+        if ts <= ref_time_ms:
+            best = txt
+        else:
+            break
+    if best is not None:
+        return best
+    try:
+        import json as _json
+        if Path(_outbound_cache_path).exists():
+            with open(_outbound_cache_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = _json.loads(line)
+                        if item.get("ts", 0) <= ref_time_ms:
+                            best = item.get("text", "")
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    try:
+        import json as _json
+        if Path(_outbound_cache_path).exists():
+            with open(_outbound_cache_path) as f:
+                lines = [l for l in f if l.strip()]
+            if len(lines) > 200:
+                with open(_outbound_cache_path, 'w') as f:
+                    f.writelines(lines[-200:])
+    except Exception:
+        pass
+    return best
 def check_weixin_requirements() -> bool:
     return AIOHTTP_AVAILABLE and CRYPTO_AVAILABLE
 
@@ -543,7 +641,38 @@ def _extract_text(item_list: list[dict[str, Any]]) -> str:
                 title = ref.get("title") or ""
                 return f"[引用媒体: {title}]\n{text}".strip() if title else f"[引用媒体]\n{text}".strip()
             if ref_item:
-                parts = [p for p in (str(ref["title"]) if ref.get("title") else "", _extract_text([ref_item])) if p]
+
+                parts: List[str] = []
+                if ref.get("title"):
+                    parts.append(str(ref["title"]))
+                ref_text = _extract_text([ref_item])
+                # 缓存回退：WeChat iLink 新版 ref_msg 只含 msg_id 不含文字
+                if not ref_text:
+                    ref_msg_id = str(ref_item.get("msg_id")) if ref_item.get("msg_id") else None
+                    cached = _msg_text_cache.get(ref_msg_id) if ref_msg_id else None
+                    if not cached and ref_msg_id:
+                        cached = _query_ref_cache(ref_msg_id)  # 持久化回退
+                    if cached:
+                        ref_text = cached
+                    else:
+                        ref_time_ms = None
+                        if ref_item:
+                            ref_time_ms = ref_item.get("create_time_ms") or ref_item.get("create_time")
+                        if ref_time_ms:
+                            try:
+                                outbound_text = _lookup_outbound(int(ref_time_ms))
+                                if outbound_text:
+                                    ref_text = outbound_text
+                                    logger.warning("[Weixin] refmsg cache TIME-MATCH: ts=%s len=%d", ref_time_ms, len(outbound_text))
+                                else:
+                                    ref_text = "[引用消息]"
+                            except (ValueError, TypeError):
+                                ref_text = "[引用消息]"
+                        else:
+                            ref_text = "[引用消息]"
+                if ref_text:
+                    parts.append(ref_text)
+
                 if parts:
                     return f"[引用: {' | '.join(parts)}]\n{text}".strip()
             return text
@@ -901,6 +1030,33 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             logger.debug("[%s] Content-dedup: skipping duplicate message from %s", self.name, sender_id)
             return
         chat_type, effective_chat_id = _guess_chat_type(message, self._account_id)
+
+        # 引用消息缓存：将每条入站消息存入缓存（供 ref_msg 三层回退查找）
+        cache_key = str(message.get("message_id") or "").strip()
+        if cache_key:
+            for item in item_list:
+                item_type = item.get("type")
+                cached_text = None
+                if item_type == ITEM_TEXT:
+                    cached_text = str((item.get("text_item") or {}).get("text") or "").strip()
+                elif item_type == ITEM_IMAGE:
+                    img = item.get("image_item") or {}
+                    cached_text = f"[图片] {img.get('width', '?')}x{img.get('height', '?')}"
+                elif item_type == ITEM_VIDEO:
+                    vid = item.get("video_item") or {}
+                    cached_text = f"[视频] {vid.get('duration', '?')}s"
+                elif item_type == ITEM_FILE:
+                    f_item = item.get("file_item") or {}
+                    fname = f_item.get("file_name") or f_item.get("title") or "文件"
+                    fsize = f_item.get("size") or 0
+                    cached_text = f"[文件] {fname} ({fsize}B)"
+                elif item_type == ITEM_VOICE:
+                    cached_text = str((item.get("voice_item") or {}).get("text") or "").strip()
+                if cached_text:
+                    _cache_message_text(cache_key, cached_text)
+                    logger.debug("[Weixin] refmsg cache INBOUND: key=%s type=%s len=%d",
+                        cache_key[:40], item_type, len(cached_text))
+
         if chat_type == "group":
             if not self._is_group_allowed(effective_chat_id):
                 return
@@ -1066,6 +1222,10 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                         continue
                     self._rate_limit_events.clear()
                     self._rate_limit_circuit_until = 0.0
+                    # 出站消息时间戳记录：供引用消息时间窗口匹配
+                    if chunk:
+                        _record_outbound(chunk)
+                        logger.debug("[Weixin] refmsg cache OUTBOUND: queue=%d len=%d", len(_outbound_queue), len(chunk))
                     return
                 except Exception as exc:
                     last_error = exc
@@ -1107,15 +1267,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 try:
                     await getattr(self, sender)(chat_id=chat_id, metadata=metadata, **{key: path})
                 except Exception as exc:
-
-                    logger.warning("[%s] media delivery failed for %s: %s", self.name, media_path, exc)
-
-            # Deliver bare local file paths.
-            for file_path in local_files:
-                try:
-                    await _deliver_media(file_path, is_voice=False)
-                except Exception as exc:
-                    logger.warning("[%s] local file delivery failed for %s: %s", self.name, file_path, exc)
+                    logger.warning("[%s] media delivery failed for %s: %s", self.name, path, exc)
 
             # Deliver text content.
             # 2026-08-04 投递优化: 短消息合并 + 长消息(>2000字符)转 MD 文件。

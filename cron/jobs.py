@@ -1831,6 +1831,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+
     failure_deliver: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
@@ -1937,6 +1938,7 @@ def create_job(
     ):
         if value is not None:
             job[key] = value
+
 
     with _jobs_lock():
         save_jobs(load_jobs() + [job])

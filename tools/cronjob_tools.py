@@ -1009,8 +1009,7 @@ def cronjob(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[str | list[str]] = None,
-    task_id: str | None = None,
-    session_id: Optional[str] = None,
+    task_id: str | None = None,    session_id: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
     pinned: Optional[bool] = None,
@@ -1020,6 +1019,7 @@ def cronjob(
     del a["task_id"]  # unused but kept for handler signature compatibility
     try:
         normalized = (action or "").strip().lower()
+
         handler = _JOBLESS_ACTIONS.get(normalized)
         if handler is not None:
             return handler(a)
@@ -1034,6 +1034,7 @@ def cronjob(
         if handler is None:
             return tool_error(f"Unknown cron action '{action}'", success=False)
         return handler(job, a)
+
     except Exception as e:
         return tool_error(str(e), success=False)
 
