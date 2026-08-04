@@ -55,6 +55,11 @@ EP_GET_BOT_QR, EP_GET_QR_STATUS = "ilink/bot/get_bot_qrcode", "ilink/bot/get_qrc
 LONG_POLL_TIMEOUT_MS, API_TIMEOUT_MS, CONFIG_TIMEOUT_MS, QR_TIMEOUT_MS = 35_000, 15_000, 10_000, 35_000
 MAX_CONSECUTIVE_FAILURES, RETRY_DELAY_SECONDS, BACKOFF_DELAY_SECONDS = 3, 2, 30
 SESSION_EXPIRED_ERRCODE, RATE_LIMIT_ERRCODE = -14, -2  # -2: iLink frequency limit — backoff and retry
+
+# 2026-08-04 投递优化: 长消息阈值——超过则转 MD 文件发送（替代拆 chunk 撞 iLink 限流窗口）。
+# 上游 #184 实证: 同一用户 60s 窗口 >10 条被拒; 合并短块 + 长文转文件从源头减少 sendmessage 调用。
+_WEIXIN_LONG_MSG_THRESHOLD = 2000  # 字符; 杨旸拍板
+_WEIXIN_MD_DIR = "投递"  # ~/hermes-media/投递/ — 已验证在 send-media-safe 白名单内
 MESSAGE_DEDUP_TTL_SECONDS = 300
 MEDIA_IMAGE, MEDIA_VIDEO, MEDIA_FILE, MEDIA_VOICE = 1, 2, 3, 4  # getuploadurl media_type
 ITEM_TEXT, ITEM_IMAGE, ITEM_VOICE, ITEM_FILE, ITEM_VIDEO = 1, 2, 3, 4, 5  # item_list entry types
@@ -723,10 +728,17 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._send_chunk_retries = int(_extra_or_secret(extra, "send_chunk_retries", "4"))
         self._send_chunk_retry_delay_seconds = float(_extra_or_secret(extra, "send_chunk_retry_delay_seconds", "1.0"))
         self._send_text_gate = asyncio.Lock()
-        self._rate_limit_circuit_threshold = max(1, int(_extra_or_secret(extra, "rate_limit_circuit_threshold", "1")))
+        self._rate_limit_circuit_threshold = max(1, int(_extra_or_secret(extra, "rate_limit_circuit_threshold", "3")))
         self._rate_limit_circuit_window_seconds = float(_extra_or_secret(extra, "rate_limit_circuit_window_seconds", "30.0"))
         self._rate_limit_circuit_open_seconds = float(_extra_or_secret(extra, "rate_limit_circuit_open_seconds", "30.0"))
         self._rate_limit_circuit_until, self._rate_limit_events = 0.0, []  # type: float, List[float]
+        # 2026-08-02 根因修复2: 滑动窗口总量锁 — iLink 限制是窗口总量(实测 6-7 条/5-8min),
+        # 不是单条间隔。所有来源(cron/ledger/补投/会话)共用此计数, 超限排队等待窗口滑动。
+        # 默认 5 分钟 ≤5 条(实测值留余量)。可配置 WEIXIN_SLIDING_WINDOW_SECONDS/MAX。
+        self._sliding_window_seconds = float(_extra_or_secret(extra, "sliding_window_seconds", "300.0"))
+        self._sliding_window_max = max(1, int(_extra_or_secret(extra, "sliding_window_max", "5")))
+        self._sliding_window_events: List[float] = []
+        self._sliding_gate = asyncio.Lock()
         self._dm_policy = _extra_or_secret(extra, "dm_policy", "pairing").lower()
         self._group_policy = _extra_or_secret(extra, "group_policy", "disabled").lower()
         # ``extra`` wins even when falsy (an explicit empty list disables the env allowlist).
@@ -965,6 +977,40 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     def _rate_limit_cooldown_remaining(self) -> float:
         return max(0.0, self._rate_limit_circuit_until - time.monotonic())
 
+    async def _acquire_sliding_window_slot(self) -> bool:
+        """2026-08-02 根因修复2: 滑动窗口总量锁。
+
+        维护 send 时间戳滑动窗口(默认 300s), 窗口内已发 >= max(默认 5) 时
+        等待最早一条滑出窗口再放行。所有来源共用 — 防批量投递风暴。
+        等待一轮窗口滑动(<= window_seconds)仍无空位 → 返回 False 放弃本次发送
+        （由上层 ledger/cron 保留消息稍后重试，修复1保证不丢），
+        **绝不超时后强行发送**——强行发送 = 撞限流续惩罚（8/2 16:11 实测教训）。
+        """
+        if self._sliding_window_seconds <= 0 or self._sliding_window_max <= 0:
+            return True
+        # 最多等一轮窗口滑动
+        deadline = time.monotonic() + self._sliding_window_seconds
+        while True:
+            async with self._sliding_gate:
+                now = time.monotonic()
+                cutoff = now - self._sliding_window_seconds
+                self._sliding_window_events = [
+                    ts for ts in self._sliding_window_events if ts >= cutoff
+                ]
+                if len(self._sliding_window_events) < self._sliding_window_max:
+                    self._sliding_window_events.append(now)
+                    return True
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "[%s] sliding window slot busy for %.0fs — dropping send "
+                    "(backlog preserved by ledger/cron for retry)",
+                    self.name, self._sliding_window_seconds,
+                )
+                return False
+            # 等最早事件滑出窗口
+            wait_for = max(0.0, self._sliding_window_events[0] + self._sliding_window_seconds - time.monotonic())
+            await asyncio.sleep(min(wait_for, 5.0))
+
     def _record_rate_limit_event(self) -> bool:
         now = time.monotonic()
         self._rate_limit_events = [ts for ts in self._rate_limit_events if ts >= now - self._rate_limit_circuit_window_seconds] + [now]
@@ -1037,6 +1083,14 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
+        # 2026-08-02 根因修复2: 滑动窗口总量锁 — 超限时等待窗口滑动(排队), 防批量投递风暴。
+        # 正常会话交互频率远低于限额(5min≤5条), 不会实际排队; 只有 cron/ledger/补投批量叠加才触发。
+        # 等一轮窗口仍无空位 → 放弃返回失败(上层 ledger/cron 保留消息稍后重试), 绝不硬发撞限流。
+        if not await self._acquire_sliding_window_slot():
+            return SendResult(
+                success=False,
+                error="Sliding window busy (rate limit budget exhausted)",
+            )
         context_token = self._token_store.get(self._account_id, chat_id)
         last_message_id: Optional[str] = None
         # Extract MEDIA: tags and bare local file paths before text delivery, under the routed
@@ -1053,18 +1107,91 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 try:
                     await getattr(self, sender)(chat_id=chat_id, metadata=metadata, **{key: path})
                 except Exception as exc:
-                    logger.warning("[%s] %s delivery failed for %s: %s", self.name, label, path, exc)
-            chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
-            for idx, chunk in enumerate(chunks):
-                client_id = f"hermes-weixin-{uuid.uuid4().hex}"
-                await self._send_text_chunk(chat_id=chat_id, chunk=chunk, context_token=context_token, client_id=client_id)
-                last_message_id = client_id
-                if idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:
-                    await asyncio.sleep(self._send_chunk_delay_seconds)
+
+                    logger.warning("[%s] media delivery failed for %s: %s", self.name, media_path, exc)
+
+            # Deliver bare local file paths.
+            for file_path in local_files:
+                try:
+                    await _deliver_media(file_path, is_voice=False)
+                except Exception as exc:
+                    logger.warning("[%s] local file delivery failed for %s: %s", self.name, file_path, exc)
+
+            # Deliver text content.
+            # 2026-08-04 投递优化: 短消息合并 + 长消息(>2000字符)转 MD 文件。
+            # 上游 #184: 同一用户 60s 窗口 >10 条被 iLink 拒绝 → 减少 sendmessage 调用次数从源头降限流命中。
+            # 合并规则: 连续短块(单块<500字符)以空行分隔合并; 累计≥2000字符 → 转 MD 文件发送。
+            final_content = final_content.strip()
+            if final_content:
+                if len(final_content) > _WEIXIN_LONG_MSG_THRESHOLD:
+                    # 长消息 → MD 文件（替代拆 chunk 撞窗口）
+                    md_path = await self._write_long_message_md(final_content)
+                    await self.send_document(chat_id=chat_id, file_path=md_path, metadata=metadata)
+                    last_message_id = f"md-{Path(md_path).stem}"
+                else:
+                    # 短消息路径: 拆分后合并相邻短块 → 减少 sendmessage 调用次数（#184）。
+                    # 合并规则: 单块 <500 字符且非代码块 → 以空行连接累积; 累计 ≥2000 或遇大块/代码块 → flush。
+                    raw_chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
+                    chunks: List[str] = []
+                    pending: List[str] = []
+                    pending_len = 0
+                    _MERGE_SHORT_CHUNK_LIMIT = 500   # 单块小于此值才参与合并
+                    _MERGE_TOTAL_LIMIT = 1800         # 合并累计上限（留 200 余量避免触碰长消息阈值）
+
+                    def _flush_pending() -> None:
+                        nonlocal pending, pending_len
+                        if pending:
+                            chunks.append("\n\n".join(pending))
+                            pending = []
+                            pending_len = 0
+
+                    for chunk in raw_chunks:
+                        is_code_block = _FENCE_RE.match(chunk.splitlines()[0].strip()) if chunk.splitlines() else False
+                        chunk_len = len(chunk)
+                        if (
+                            not is_code_block
+                            and chunk_len < _MERGE_SHORT_CHUNK_LIMIT
+                            and pending_len + chunk_len + 2 < _MERGE_TOTAL_LIMIT
+                        ):
+                            pending.append(chunk)
+                            pending_len += chunk_len
+                        else:
+                            _flush_pending()
+                            chunks.append(chunk)
+                    _flush_pending()
+
+                    for idx, chunk in enumerate(chunks):
+                        client_id = f"hermes-weixin-{uuid.uuid4().hex}"
+                        await self._send_text_chunk(
+                            chat_id=chat_id,
+                            chunk=chunk,
+                            context_token=context_token,
+                            client_id=client_id,
+                        )
+                        last_message_id = client_id
+                        if idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:
+                            await asyncio.sleep(self._send_chunk_delay_seconds)
             return SendResult(success=True, message_id=last_message_id)
         except Exception as exc:
             logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
             return SendResult(success=False, error=str(exc))
+
+    async def _write_long_message_md(self, content: str) -> str:
+        """Write a long message to an MD file under ~/hermes-media/投递/ for document delivery.
+
+        2026-08-04: 长消息(>2000字符)不再拆 chunk 逐条 sendmessage（撞 iLink 限流窗口），
+        而是写成 MD 文件走 send_document 单次投递。路径在 send-media-safe 白名单内。
+        """
+        import time as _time
+        md_dir = Path.home() / "hermes-media" / _WEIXIN_MD_DIR
+        md_dir.mkdir(parents=True, exist_ok=True)
+        # 文件名: {时间戳}_{内容前20字符清洗}.md — 避免 emoji/斜杠/空格
+        safe_head = re.sub(r"[^\w\u4e00-\u9fff-]", "", content[:20]) or "message"
+        fname = f"{_time.strftime('%Y%m%d_%H%M%S')}_{safe_head}.md"
+        path = md_dir / fname
+        path.write_text(content, encoding="utf-8")
+        logger.info("[%s] long message (%d chars) → %s", self.name, len(content), path)
+        return str(path)
 
     async def _ensure_typing_ticket(self, chat_id: str) -> Optional[str]:
         """Return a valid typing ticket, refreshing via getConfig once the 600s TTL evicts it —

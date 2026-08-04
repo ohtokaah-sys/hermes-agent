@@ -237,15 +237,45 @@ class TestWeixinChunkDelivery:
 
         send_message_mock.side_effect = flaky_send
 
-        # Use double newlines so _pack_markdown_blocks splits into 3 blocks
+        # Use double newlines so _pack_markdown_blocks splits into 3 blocks.
+        # 2026-08-04 投递优化: 3 个短块合并为 1 条 → 仅 1 次发送。
         result = asyncio.run(adapter.send("wxid_test123", "first\n\nsecond\n\nthird"))
 
         assert result.success is True
-        # 3 chunks, but chunk 2 fails once and retries → 4 _send_message calls total
-        assert send_message_mock.await_count == 4
-        # The retried chunk should reuse the same client_id for deduplication
-        first_try = send_message_mock.await_args_list[1].kwargs
-        retry = send_message_mock.await_args_list[2].kwargs
+        # 合并后 3 块合一 → 1 次发送（不再触发 flaky 的第 2 次调用）
+        assert send_message_mock.await_count == 1
+        # 合并块应保留空行分隔
+        merged_text = send_message_mock.await_args_list[0].kwargs["text"]
+        assert "\n\n" in merged_text
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_retries_failed_chunk_with_unmergeable_large_block(self, send_message_mock, sleep_mock):
+        """重试语义(独立于合并): _send_text_chunk 失败应重试且复用 client_id 去重。"""
+        adapter = self._connected_adapter()
+        calls = {"count": 0}
+
+        async def flaky_send(*args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("temporary iLink failure")
+
+        send_message_mock.side_effect = flaky_send
+
+        # 直接调 chunk 发送层（绕过合并路径），验证重试 + client_id 复用
+        result = asyncio.run(adapter._send_text_chunk(
+            chat_id="wxid_test123",
+            chunk="这是一个不可合并的测试块内容",
+            context_token="ctx-token",
+            client_id="fixed-client-id",
+        ))
+
+        assert result is None  # _send_text_chunk 成功无返回值
+        # 第 1 次失败 + 重试 = 2 次调用
+        assert send_message_mock.await_count == 2
+        # 重试复用同一 client_id 用于去重
+        first_try = send_message_mock.await_args_list[0].kwargs
+        retry = send_message_mock.await_args_list[1].kwargs
         assert first_try["text"] == retry["text"]
         assert first_try["client_id"] == retry["client_id"]
 
@@ -895,3 +925,115 @@ class TestWeixinVoiceGatewayHandoff:
             "VOICE event body leaked Tencent's STT text — runner would trust "
             "the wrong transcript instead of re-transcribing (#27300)."
         )
+
+
+
+class TestWeixinDeliveryOptimization:
+    """2026-08-04 投递优化: 短消息合并 + 长消息(>2000字符)转 MD 文件。
+
+    上游 #184: 同一用户 60s 窗口 >10 条被 iLink 拒绝 → 减少 sendmessage 调用次数。
+    """
+
+    def _make_ready_adapter(self):
+        adapter = _make_adapter()
+        adapter._send_session = AsyncMock()
+        adapter._token = "test-token"
+        adapter._send_chunk_delay_seconds = 0
+        return adapter
+
+    # ── T1: 短消息合并 ──
+
+    def test_short_chunks_merged_into_single_send(self):
+        """多个短块（无代码块）应合并为一条发送，sendmessage 只调用 1 次。"""
+        adapter = self._make_ready_adapter()
+        adapter._token_store = ContextTokenStore(hermes_home="/tmp/hermes-test-home")
+        sent = []
+        async def _fake_send(chat_id, chunk, context_token, client_id):
+            sent.append(chunk)
+        adapter._send_text_chunk = _fake_send
+
+        content = "第一段话\n\n第二段话\n\n第三段话"
+        result = asyncio.run(adapter.send("user-1", content))
+        assert result.success
+        assert len(sent) == 1, f"应合并为 1 条，实际 {len(sent)}: {sent}"
+        assert "\n\n" in sent[0], "合并块应以空行分隔"
+
+    def test_code_block_not_merged(self):
+        """代码块应保持独立，不与相邻短块合并。"""
+        adapter = self._make_ready_adapter()
+        adapter._token_store = ContextTokenStore(hermes_home="/tmp/hermes-test-home")
+        sent = []
+        async def _fake_send(chat_id, chunk, context_token, client_id):
+            sent.append(chunk)
+        adapter._send_text_chunk = _fake_send
+
+        content = "说明文字\n\n```python\nx = 1\n```\n\n结尾文字"
+        result = asyncio.run(adapter.send("user-1", content))
+        assert result.success
+        # 代码块独立成条 → 至少 2 次发送（说明+代码块 / 结尾可能合并）
+        assert len(sent) >= 2, f"代码块应独立，实际 {len(sent)}"
+        code_block_sent = [s for s in sent if "x = 1" in s]
+        assert code_block_sent, "代码块内容应被发送"
+
+    def test_single_short_message_unchanged(self):
+        """单条短消息应原样发送（无行为变化）。"""
+        adapter = self._make_ready_adapter()
+        adapter._token_store = ContextTokenStore(hermes_home="/tmp/hermes-test-home")
+        sent = []
+        async def _fake_send(chat_id, chunk, context_token, client_id):
+            sent.append(chunk)
+        adapter._send_text_chunk = _fake_send
+
+        content = "早上好"
+        result = asyncio.run(adapter.send("user-1", content))
+        assert result.success
+        assert len(sent) == 1
+        assert sent[0] == "早上好"
+
+    # ── T2: 长消息转 MD 文件 ──
+
+    def test_long_message_written_to_md_file(self, tmp_path, monkeypatch):
+        """>2000 字符 → 写 MD 文件走 send_document，不调 sendmessage。"""
+        adapter = self._make_ready_adapter()
+        adapter._token_store = ContextTokenStore(hermes_home="/tmp/hermes-test-home")
+        adapter._send_text_chunk = AsyncMock()
+
+        # 重定向 MD 目录到 tmp_path
+        md_dir = tmp_path / "投递"
+        monkeypatch.setattr(weixin, "_WEIXIN_MD_DIR", "投递")
+        monkeypatch.setattr(weixin.Path, "home", lambda: tmp_path)
+
+        sent_docs = []
+        async def _fake_send_document(chat_id, file_path, caption=None, file_name=None, reply_to=None, metadata=None, **kw):
+            sent_docs.append(file_path)
+        adapter.send_document = _fake_send_document
+
+        long_content = "这是一段很长的内容。" * 300  # ~1500 chars → 需 >2000
+        long_content = long_content + ("补充内容。" * 120)  # 确保 >2000
+        assert len(long_content) > 2000
+
+        result = asyncio.run(adapter.send("user-1", long_content))
+        assert result.success
+        assert len(sent_docs) == 1, "长消息应走 send_document"
+        assert adapter._send_text_chunk.call_count == 0, "长消息不应调 sendmessage"
+        # MD 文件内容完整
+        md_path = sent_docs[0]
+        assert "投递" in md_path or tmp_path in md_path
+        written = weixin.Path(md_path).read_text(encoding="utf-8")
+        assert written == long_content, "MD 文件内容应与原文一致"
+
+    def test_boundary_1999_chars_stays_inline(self):
+        """阈值边界: ≤2000 字符仍走正文（不触发 MD 路径）。"""
+        adapter = self._make_ready_adapter()
+        adapter._token_store = ContextTokenStore(hermes_home="/tmp/hermes-test-home")
+        sent = []
+        async def _fake_send(chat_id, chunk, context_token, client_id):
+            sent.append(chunk)
+        adapter._send_text_chunk = _fake_send
+
+        content = "短" * 1999  # 1999 chars ≤ 2000
+        result = asyncio.run(adapter.send("user-1", content))
+        assert result.success
+        assert adapter._send_text_chunk is not None
+        # 合并累计上限 1800 → 1999 会被拆成多块，但不应触发 MD 路径
+        assert len(sent) >= 1

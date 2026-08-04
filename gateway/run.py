@@ -3986,9 +3986,9 @@ class GatewayRunner(
     _STUCK_LOOP_THRESHOLD = 3  # restarts while active before auto-suspend
     _STUCK_LOOP_FILE = ".restart_failure_counts"
 
-    # Reasons set by _stop_impl() on force-interrupt; "restart_interrupted" by recover_interrupted_turns()
-    # for a crash-left turn marker (no .clean_shutdown marker). All mean "killed mid-turn" -> startup
-    # auto-resume.
+
+    # Reasons set by _stop_impl() on force-interrupt; "restart_interrupted" by suspend_recently_active()
+    # on crash recovery (no .clean_shutdown marker). All mean "killed mid-turn" -> startup auto-resume.
     _AUTO_RESUME_REASONS = frozenset({"restart_timeout", "shutdown_timeout", "restart_interrupted"})
 
     _MAX_SUPERVISED_RESTARTS = 5
