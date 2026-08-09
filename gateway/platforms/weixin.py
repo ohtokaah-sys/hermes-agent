@@ -137,6 +137,9 @@ _ref_db_lock = _threading.Lock()
 
 def _init_ref_db() -> None:
     with _ref_db_lock:
+        # Ensure the parent dir exists (sandboxed HERMES_HOME in tests has no
+        # state/; production cold start may not either).
+        Path(_ref_db_path).parent.mkdir(parents=True, exist_ok=True)
         db = _sqlite3.connect(_ref_db_path)
         db.execute("CREATE TABLE IF NOT EXISTS cache (msg_id TEXT PRIMARY KEY, text TEXT, ts INTEGER)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_ts ON cache(ts)")
