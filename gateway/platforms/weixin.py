@@ -61,16 +61,24 @@ ITEM_TEXT, ITEM_IMAGE, ITEM_VOICE, ITEM_FILE, ITEM_VIDEO = 1, 2, 3, 4, 5  # item
 MSG_TYPE_BOT, MSG_STATE_FINISH = 2, 2
 TYPING_START, TYPING_STOP = 1, 2
 _LIVE_ADAPTERS: dict[str, Any] = {}
-_HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
-_TABLE_RULE_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
-_FENCE_RE = re.compile(r"^```([^\n`]*)\s*$")
 
 
-def _is_stale_session_ret(ret: Optional[int], errcode: Optional[int], errmsg: Optional[str]) -> bool:
-    """Recognize stale-session variants of iLink's ``-2`` response, not real rate limits."""
-    return (ret == RATE_LIMIT_ERRCODE or errcode == RATE_LIMIT_ERRCODE) and (errmsg or "").lower() in {
-        "unknown error",
-        "prepare failed",
+def _is_stale_session_ret(ret: "Optional[int]", errcode: "Optional[int]", errmsg: "Optional[str]") -> bool:
+    """True when iLink returns ret=-2 / errcode=-2 — iLink treats this as a
+    stale-session signal (same class as errcode=-14) when errmsg is NOT a
+    recognized genuine-rate-limit wording. iLink's errmsg wording is not
+    stable across deployments (observed: 'unknown error', 'prepare failed'),
+    so we treat ret=-2 as stale first and let the tokenless retry decide
+    (a real rate limit will fail again, then backoff).
+
+    本地定制（保留）：上游 v0.22.2 只认固定措辞 {"unknown error", "prepare failed"}；
+    本实现 wording-agnostic（排除已知限流措辞即视为 stale）——新措辞不会退回限流误判，
+    避免 2026-08-08 的 30h 投递中断复发。
+    """
+    if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
+        return False
+    return (errmsg or "").lower() not in {
+        "", "rate limited", "frequency limit", "freq limit",
     }
 
 

@@ -572,6 +572,36 @@ class TestIsStaleSessionRet:
 
 
 
+    def test_ret_minus_2_with_prepare_failed_is_stale(self):
+        # 2026-08-08 incident: iLink returns ret=-2 errmsg="prepare failed"
+        # for a stale context_token. Before the wording-agnostic fix this was
+        # misclassified as a rate limit, disabling the tokenless fallback for
+        # ~30h. Now any non-rate-limit wording is treated as stale so the
+        # tokenless retry path (L2034) can run.
+        assert weixin._is_stale_session_ret(-2, None, "prepare failed") is True
+
+
+    def test_ret_minus_2_with_unknown_error_is_stale(self):
+        # Original #17228 wording — must keep working after the fix.
+        assert weixin._is_stale_session_ret(-2, None, "unknown error") is True
+
+
+    def test_ret_minus_2_with_rate_limited_wording_is_not_stale(self):
+        # Genuine rate limit wordings must stay on the rate-limit path.
+        for wording in ("rate limited", "frequency limit"):
+            assert weixin._is_stale_session_ret(-2, None, wording) is False
+
+
+    def test_ret_minus_2_with_empty_errmsg_is_not_stale(self):
+        # Empty errmsg is ambiguous — conservative: do not strip the token
+        # (matches pre-fix behavior for the tokenless retry guard).
+        assert weixin._is_stale_session_ret(-2, None, "") is False
+
+
+    def test_ret_0_is_never_stale(self):
+        assert weixin._is_stale_session_ret(0, 0, "prepare failed") is False
+
+
 class TestWeixinContentDedup:
     """Regression tests for Issue #16182 — upstream API sends duplicate content
     with different message_ids, bypassing message_id deduplication.
