@@ -981,7 +981,7 @@ class TestWeixinDeliveryOptimization:
         adapter = self._make_ready_adapter()
         adapter._token_store = ContextTokenStore(hermes_home="/tmp/hermes-test-home")
         sent = []
-        async def _fake_send(chat_id, chunk, context_token, client_id):
+        async def _fake_send(chat_id, chunk, context_token, client_id, source="cron"):
             sent.append(chunk)
         adapter._send_text_chunk = _fake_send
 
@@ -996,7 +996,7 @@ class TestWeixinDeliveryOptimization:
         adapter = self._make_ready_adapter()
         adapter._token_store = ContextTokenStore(hermes_home="/tmp/hermes-test-home")
         sent = []
-        async def _fake_send(chat_id, chunk, context_token, client_id):
+        async def _fake_send(chat_id, chunk, context_token, client_id, source="cron"):
             sent.append(chunk)
         adapter._send_text_chunk = _fake_send
 
@@ -1013,7 +1013,7 @@ class TestWeixinDeliveryOptimization:
         adapter = self._make_ready_adapter()
         adapter._token_store = ContextTokenStore(hermes_home="/tmp/hermes-test-home")
         sent = []
-        async def _fake_send(chat_id, chunk, context_token, client_id):
+        async def _fake_send(chat_id, chunk, context_token, client_id, source="cron"):
             sent.append(chunk)
         adapter._send_text_chunk = _fake_send
 
@@ -1060,7 +1060,7 @@ class TestWeixinDeliveryOptimization:
         adapter = self._make_ready_adapter()
         adapter._token_store = ContextTokenStore(hermes_home="/tmp/hermes-test-home")
         sent = []
-        async def _fake_send(chat_id, chunk, context_token, client_id):
+        async def _fake_send(chat_id, chunk, context_token, client_id, source="cron"):
             sent.append(chunk)
         adapter._send_text_chunk = _fake_send
 
