@@ -3,6 +3,8 @@
 import asyncio
 import base64
 import json
+import os
+import time
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -373,6 +375,37 @@ class TestWeixinChunkDelivery:
         assert result.success is False
         assert "session not ready" in (result.error or "") and "prepare failed" in (result.error or "")
         assert [call.kwargs["context_token"] for call in send_items_mock.await_args_list] == ["ctx-token", None]
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._read_slowlane",
+           return_value={"mode": "EXPIRED", "last_send_ts": time.time()})
+    def test_slowlane_queues_when_token_expired_and_window_busy(self, slowlane_mock, send_message_mock, sleep_mock):
+        """v2 (2026-08-19): EXPIRED 模式窗口未到 → 排队（success=False + slowlane 错误），
+        不硬发撞限流；错误文案不含 ret=-2（fallback-alert 不误计）。"""
+        adapter = self._connected_adapter()
+
+        result = asyncio.run(adapter.send("wxid_test123", "slow lane test"))
+
+        assert result.success is False
+        assert "slowlane" in (result.error or "")
+        assert "ret=-2" not in (result.error or "")
+        # 没有真实发送尝试（等待窗口后入队）
+        assert send_message_mock.await_count == 0
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._read_slowlane",
+           return_value={"mode": "FRESH", "last_send_ts": 0.0})
+    def test_slowlane_fresh_mode_bypasses_queuing(self, slowlane_mock, send_message_mock, sleep_mock):
+        """v2: FRESH 模式不受慢速锁影响（正常发送）。"""
+        adapter = self._connected_adapter()
+        send_message_mock.return_value = {"ret": 0}
+
+        result = asyncio.run(adapter.send("wxid_test123", "normal message"))
+
+        assert result.success is True
+        assert send_message_mock.await_count == 1
 
 
 class TestWeixinOutboundMedia:

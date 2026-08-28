@@ -88,6 +88,18 @@ def is_autonomous_silence_response(response: Any) -> bool:
     if not stripped:
         return False
     lines = [ln for ln in stripped.splitlines() if ln.strip()]
+    # ── v2026-08-12 中文伪抑制语义识别（治本：agent 描述「抑制投递」而非输出标记）──
+    # 实证：cf0040dde46d「按 cron 协议抑制本次投递」→ 被当正常内容投递（8/12）。
+    # 判据：响应明确表达「本次不投递」意图（非正文提及），短响应时判定为静默。
+    # 覆盖：抑制本次投递 / 抑制投递 / 无需推送 / 不推送 / 无需发送 / 本次不发送 /
+    #       跳过投递 / 按协议抑制 / 无新话题可处理 / 无内容可报 / 无需提醒
+    _CN_PSEUDO_SUPPRESS = (
+        "抑制本次投递", "抑制投递", "无需推送", "不推送", "无需发送",
+        "本次不发送", "跳过投递", "按协议抑制", "按 cron 协议", "协议抑制",
+        "无新话题可处理", "无内容可报", "无需提醒", "本次无需",
+    )
+    if len(stripped) <= 300 and any(kw in stripped for kw in _CN_PSEUDO_SUPPRESS):
+        return True
     # Bracketed form only for the prefix rule, so a bare "Silent retry succeeded" is NOT swallowed.
     # Same de-punctuating forms as the interactive rule, so ``【静默】`` / ``静默。`` cannot
     # be suppressed in chat yet delivered by cron.

@@ -3081,9 +3081,14 @@ class BasePlatformAdapter(ABC):
         cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
         # 本地独有：MEDIA 未识别扩展名警告
-        unrecognized = re.findall(r'MEDIA:\s*\S+', cleaned)
+        # 2026-08-10: 修复误导警告——原正则匹配任何 MEDIA: 标签即报警（不查扩展名），产生大量噪音。
+        # 现在只对"扩展名不在 MEDIA_DELIVERY_EXTS 白名单"的标签警告（真异常）。
+        unrecognized = re.findall(r'MEDIA:\s*(\S+)', cleaned)
         for u in unrecognized:
-            logger.warning("Unrecognized MEDIA extension (not in whitelist): %s", u[:120])
+            media_path = u.strip().rstrip('\"\';:)}]')
+            ext = os.path.splitext(media_path)[1].lower()
+            if ext not in MEDIA_DELIVERY_EXTS:
+                logger.warning("Unrecognized MEDIA extension (not in whitelist): %s", media_path[:120])
 
         return images, cleaned
         def _remove_if_extracted(match):

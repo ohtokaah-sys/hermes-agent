@@ -49,6 +49,14 @@ standalone plugin repo).
 isolation is often the design (profiles are islands on purpose), an absence can be load-bearing,
 and a fix that cannot point to the line where the bug manifests has an unverified premise.
 
+- **系统提示注入点四问（2026-08-04 CI 固化，防缓存破坏）**：任何新注入点上线前，必须四问全过才能进系统提示——
+  ① 字节级稳定吗？（不随时间/轮次变化）
+  ② 无时间戳/每轮变化内容？（datetime、random、count 等 → 禁止）
+  ③ 不会在会话中途被再生？（mtime 门控 / 脏标记 / 后台 cron 重写 → 会破坏跨天会话缓存）
+  ④ 变更必须走 user-message 通道？（每轮变化的内容 → 放用户消息前，如 must-deliver notes 的既有做法）
+  违反任一 → 内容放 user-message 通道，或加插件级稳定性检测（pre_llm_call hook 指纹对比）。
+
+
 **Security:** `SECURITY.md` is the scope authority. A §3.1 finding goes private (GitHub Security
 Advisories or security@nousresearch.com), never into a public issue, PR, commit or comment; §3.2
 hardening is ordinary public work. Name the §2 boundary crossed, with a repro on `main`.

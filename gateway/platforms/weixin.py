@@ -67,7 +67,6 @@ MSG_TYPE_BOT, MSG_STATE_FINISH = 2, 2
 TYPING_START, TYPING_STOP = 1, 2
 _LIVE_ADAPTERS: dict[str, Any] = {}
 
-
 def _is_stale_session_ret(ret: "Optional[int]", errcode: "Optional[int]", errmsg: "Optional[str]") -> bool:
     """True when iLink returns ret=-2 / errcode=-2 — iLink treats this as a
     stale-session signal (same class as errcode=-14) when errmsg is NOT a
@@ -1070,6 +1069,10 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             await self._token_store.set(self._account_id, sender_id, context_token)
         if self._poll_session and self._token and not self._typing_cache.get(sender_id):
             asyncio.create_task(self._fetch_typing_ticket(self._poll_session, sender_id, context_token or None, "getConfig failed"))
+        # 2026-08-20: inbound 事件处——刷新 slowlane 为 FRESH + 唤醒补投队列（token 恢复/会话刷新后补发积压）
+        if self._poll_session and self._token:
+            _write_slowlane("FRESH", "event-inbound")
+            asyncio.create_task(self._drain_retry_queue(wake_suspended=True))
         media_paths, media_types = [], []  # type: List[str], List[str]
         for item in item_list:
             ref_item = (item.get("ref_msg") or {}).get("message_item")
@@ -1179,69 +1182,201 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             self._rate_limit_circuit_until = max(self._rate_limit_circuit_until, time.monotonic() + self._rate_limit_circuit_open_seconds)
         return self._rate_limit_cooldown_remaining() > 0
 
-    async def _send_text_chunk(self, *, chat_id: str, chunk: str, context_token: Optional[str], client_id: str) -> None:
-        """Send one text chunk with retry/backoff under the adapter-wide text gate. A stale-session response (``-14``,
-        or ``-2`` with ``prepare failed``/``unknown error``) is re-sent once *without* ``context_token`` — iLink accepts
-        tokenless sends as a degraded fallback, which keeps cron pushes working when no user message refreshed the
-        session. A ``-2`` that survives that fails fast via ``_session_not_ready_error``."""
+    def _rate_limit_error(self) -> RuntimeError:
+        return RuntimeError(
+            f"iLink sendmessage rate limited; cooldown active for {self._rate_limit_cooldown_remaining():.1f}s"
+        )
+
+    def _reset_rate_limit_circuit(self) -> None:
+        self._rate_limit_events.clear()
+        self._rate_limit_circuit_until = 0.0
+
+    async def _send_text_chunk(
+        self,
+        *,
+        chat_id: str,
+        chunk: str,
+        context_token: Optional[str],
+        client_id: str,
+        source: str = "cron",
+    ) -> None:
+        """Send a single text chunk with per-chunk retry and backoff.
+
+        On session-expired errors (errcode -14), automatically retries
+        *without* ``context_token`` — iLink accepts tokenless sends as a
+        degraded fallback, which keeps cron-initiated push messages working
+        even when no user message has refreshed the session recently.
+        """
         async with self._send_text_gate:
-            last_error: Optional[Exception] = None
-            retried_without_token = False
-            attempt = 0  # counts real failures only — the tokenless re-send must not eat the retry budget
-            while True:
-                if self._rate_limit_cooldown_remaining() > 0:
-                    raise RuntimeError(f"iLink sendmessage rate limited; cooldown active for {self._rate_limit_cooldown_remaining():.1f}s")
-                try:
-                    resp = await _send_message(
-                        self._send_session, base_url=self._base_url, token=self._token, to=chat_id, text=chunk,
-                        context_token=context_token, client_id=client_id)
-                    ret, errcode = (resp.get("ret"), resp.get("errcode")) if resp and isinstance(resp, dict) else (None, None)
-                    if (ret is not None and ret != 0) or (errcode is not None and errcode != 0):
-                        errmsg = resp.get("errmsg") or resp.get("msg")
-                        if _is_session_expired(resp, ret, errcode) and not retried_without_token and context_token:
-                            retried_without_token, context_token = True, None
-                            self._token_store._cache.pop(self._token_store._key(self._account_id, chat_id), None)
-                            logger.warning("[%s] session expired for %s; retrying without context_token", self.name, _safe_id(chat_id))
+            await self._send_text_chunk_locked(
+                chat_id=chat_id,
+                chunk=chunk,
+                context_token=context_token,
+                client_id=client_id,
+            )
+
+    async def _send_text_chunk_locked(
+        self,
+        *,
+        chat_id: str,
+        chunk: str,
+        context_token: Optional[str],
+        client_id: str,
+        source: str = "cron",
+    ) -> None:
+        """Send a text chunk while holding the adapter-wide outbound text gate."""
+        last_error: Optional[Exception] = None
+        retried_without_token = False
+        for attempt in range(self._send_chunk_retries + 1):
+            if self._rate_limit_cooldown_remaining() > 0:
+                raise self._rate_limit_error()
+            try:
+                resp = await _send_message(
+                    self._send_session,
+                    base_url=self._base_url,
+                    token=self._token,
+                    to=chat_id,
+                    text=chunk,
+                    context_token=context_token,
+                    client_id=client_id,
+                )
+                # Check iLink response for session-expired error
+                if resp and isinstance(resp, dict):
+                    ret = resp.get("ret")
+                    errcode = resp.get("errcode")
+                    if (ret is not None and ret not in {0,}) or (errcode is not None and errcode not in {0,}):
+                        is_session_expired = (
+                            ret == SESSION_EXPIRED_ERRCODE
+                            or errcode == SESSION_EXPIRED_ERRCODE
+                            or _is_stale_session_ret(ret, errcode, resp.get("errmsg"))
+                        )
+                        # Session expired — strip token and retry once
+                        if is_session_expired and not retried_without_token and context_token:
+                            retried_without_token = True
+                            context_token = None
+                            self._token_store._cache.pop(
+                                self._token_store._key(self._account_id, chat_id), None
+                            )
+                            logger.warning(
+                                "[%s] session expired for %s; retrying without context_token",
+                                self.name, _safe_id(chat_id),
+                            )
                             continue
-                        if _is_stale_session_ret(ret, errcode, errmsg):
-                            # break, not raise: a raise here is caught below and re-enters the retry ladder.
-                            last_error = _session_not_ready_error(ret, errcode, errmsg)
-                            break
-                        if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
-                            raise RuntimeError(f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg or 'unknown error'}")
-                        # Keep a descriptive error for when the loop exhausts while still limited.
-                        last_error = RuntimeError(f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg or 'rate limited'}")
-                        if self._record_rate_limit_event():
+                        # Rate limit (-2) — backoff and retry
+                        is_rate_limited = (
+                            ret == RATE_LIMIT_ERRCODE
+                            or errcode == RATE_LIMIT_ERRCODE
+                        )
+                        if is_rate_limited:
+                            errmsg = resp.get("errmsg") or resp.get("msg") or "rate limited"
+                            # Record the error so we raise a descriptive
+                            # RuntimeError (instead of AssertionError) if the
+                            # loop exhausts with the server still rate-limiting.
                             last_error = RuntimeError(
-                                f"iLink sendmessage rate limited (ret={ret} errcode={errcode} errmsg={errmsg or 'rate limited'}); "
-                                f"cooldown active for {self._rate_limit_cooldown_remaining():.1f}s")
-                            break
-                        if attempt >= self._send_chunk_retries:
-                            break
-                        attempt += 1
-                        wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
-                        logger.warning("[%s] rate limited for %s; backing off %.1fs before retry", self.name, _safe_id(chat_id), wait)
-                        await asyncio.sleep(wait)
+                                f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}"
+                            )
+                            if self._record_rate_limit_event():
+                                last_error = self._rate_limit_error()
+                                break
+                            if attempt >= self._send_chunk_retries:
+                                break
+                            wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
+                            logger.warning(
+                                "[%s] rate limited for %s; backing off %.1fs before retry",
+                                self.name, _safe_id(chat_id), wait,
+                            )
+                            await asyncio.sleep(wait)
+                            continue
+                        errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
+                        raise RuntimeError(
+                            f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
+                        )
+                self._reset_rate_limit_circuit()
+                # 出站消息时间戳记录：供引用消息时间窗口匹配
+                if chunk:
+                    _record_outbound(chunk)
+                    logger.debug("[Weixin] refmsg cache OUTBOUND: queue=%d len=%d", len(_outbound_queue), len(chunk))
+                # 2026-08-20: 发送成功即清补投队列同 hash，防 token 恢复 drain 重复发
+                _retry_remove(chat_id, chunk)
+                return
+            except Exception as exc:
+                last_error = exc
+                if attempt >= self._send_chunk_retries:
+                    break
+                wait = self._send_chunk_retry_delay_seconds * (attempt + 1)
+                logger.warning(
+                    "[%s] send chunk failed to=%s attempt=%d/%d, retrying in %.2fs: %s",
+                    self.name,
+                    _safe_id(chat_id),
+                    attempt + 1,
+                    self._send_chunk_retries + 1,
+                    wait,
+                    exc,
+                )
+                if wait > 0:
+                    await asyncio.sleep(wait)
+        assert last_error is not None
+        # 2026-08-20: 重试耗尽仍失败 → 送入补投队列（跨进程/跨重启持久化，下次 inbound drain 延迟补发）。
+        # 覆盖瞬时限流/会话过期重试无效的长窗口失败（cron 推送数小时后仍补发，消息不丢）。
+        _retry_enqueue(chat_id, chunk, source=source)
+        raise last_error
+
+    async def _drain_retry_queue(self, wake_suspended: bool = False) -> None:
+        """v3 (2026-08-21, A方案): 冲刷补投队列（fire-and-forget，不阻塞长轮询）。
+
+        - 普通条目(status=active): 逐条走 self.send()（自带滑动窗口限速 + 慢速锁读取），成功出队、失败留队再冲。
+        - 挂起条目(status=suspended): 默认跳过不占窗口；唤醒时（入站/token刷新/30min兜底）转 active 重试；
+          挂起超 24h 无唤醒信号 → 写死信归档（全文+原因+时间可恢复，不删内容）。
+        仅在有 live adapter/session 时可用（standalone 场景由下次 inbound 触发）。
+        """
+        try:
+            if not Path(_retry_path).exists():
+                return
+            with open(_retry_path) as _f:
+                lines = [_l for _l in _f if _l.strip()]
+            if not lines:
+                return
+            remaining: List[str] = []
+            now = time.time()
+            for line in lines:
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if not item.get("to") or not item.get("text"):
+                    continue
+                # A方案: 挂起条目处理
+                if item.get("status") == "suspended":
+                    suspended_since = float(item.get("suspended_since") or item.get("ts") or now)
+                    # 24h 无信号 → 死信归档（含全文+原因+时间，可恢复）
+                    if now - suspended_since > _RETRY_SUSPEND_TTL:
+                        _retry_dead_letter(item)
+                        continue  # 归档后出队（下一轮不再留）
+                    # 未到 30min 兜底时限且未唤醒 → 跳过不占窗口
+                    if not wake_suspended and (now - suspended_since) < _RETRY_SUSPEND_FALLBACK:
+                        remaining.append(line)
                         continue
-                    self._rate_limit_events.clear()
-                    self._rate_limit_circuit_until = 0.0
-                    # 出站消息时间戳记录：供引用消息时间窗口匹配
-                    if chunk:
-                        _record_outbound(chunk)
-                        logger.debug("[Weixin] refmsg cache OUTBOUND: queue=%d len=%d", len(_outbound_queue), len(chunk))
-                    return
+                    # 唤醒/兜底到 → 转 active 参与本轮重发
+                    item["status"] = "active"
+                    item["suspended_since"] = None
+                try:
+                    source = item.get("source", "cron")
+                    result = await self.send(str(item["to"]), str(item["text"]),
+                                             metadata={"source": source})
+                    if result.success:
+                        logger.info("[%s] retry queue drained: %s (attempts=%d, source=%s)",
+                                    self.name, _safe_id(str(item["to"])), item.get("attempts", 1), source)
+                        continue  # 成功 → 出队
                 except Exception as exc:
-                    last_error = exc
-                    if attempt >= self._send_chunk_retries:
-                        break
-                    attempt += 1
-                    wait = self._send_chunk_retry_delay_seconds * attempt
-                    logger.warning("[%s] send chunk failed to=%s attempt=%d/%d, retrying in %.2fs: %s",
-                                   self.name, _safe_id(chat_id), attempt, self._send_chunk_retries + 1, wait, exc)
-                    if wait > 0:
-                        await asyncio.sleep(wait)
-            assert last_error is not None
-            raise last_error
+                    logger.warning("[%s] retry drain failed for %s: %s",
+                                   self.name, _safe_id(str(item.get("to", ""))), exc)
+                remaining.append(line)  # 失败留队
+            with open(_retry_path, "w") as _f:
+                _f.writelines(remaining)
+        except Exception:
+            pass
+
+
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         if not self._send_session or not self._token:
