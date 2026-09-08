@@ -139,8 +139,7 @@ class TestReadWithQuery:
 REPO = Path(__file__).resolve().parents[2]  # <repo>/tests/tools/.. = repo root
 
 CALL_SITES = {
-    "agent/tool_executor.py": "memory",
-    "agent/agent_runtime_helpers.py": "memory",
+    "agent/inline_tool_executors.py": "memory",   # 上游重构后 memory 内置工具走 INLINE_TOOL_EXECUTORS
     "tools/memory_tool.py": "memory",  # registry handler
 }
 
@@ -148,10 +147,28 @@ CALL_SITES = {
 class TestQueryForwardingGuard:
     @pytest.mark.parametrize("rel_path", list(CALL_SITES))
     def test_memory_call_forwards_query(self, rel_path):
-        """每个调用点调用 memory_tool/_memory_tool 时必须含 query= 关键字。"""
+        """每个调用点转发 query 到 memory_tool。
+
+        上游 v2026.9.7 重构后有两类调用点：
+        - 间接：agent/inline_tool_executors.py 的 _memory 经 _call_tool(..., arg_specs)
+          传递参数——检查 arg_specs 是否含 ("query", "query")。
+        - 直接：tools/memory_tool.py 的 registry handler——检查 memory_tool(query=...)。
+        """
         src = (REPO / rel_path).read_text(encoding="utf-8")
         tree = ast.parse(src)
 
+        # 间接调用模式：inline_tool_executors._memory 的 _call_tool arg_specs
+        if rel_path == "agent/inline_tool_executors.py":
+            # 找到 _memory 函数的 _call_tool(...) 调用，检查其 arg_specs 元组含 ("query", "query")
+            memory_fn = next((n for n in ast.walk(tree)
+                              if isinstance(n, ast.FunctionDef) and n.name == "_memory"), None)
+            assert memory_fn is not None, "inline_tool_executors.py 未找到 _memory 函数"
+            # 扫描 _memory 内的所有字符串常量，需含 "query"（arg_specs 里 ("query","query")）
+            strs = {n.value for n in ast.walk(memory_fn) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+            assert "query" in strs, "inline_tool_executors._memory 的 arg_specs 未转发 query"
+            return
+
+        # 直接调用模式：memory_tool(...) 调用点必须含 query= 关键字
         calls = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):

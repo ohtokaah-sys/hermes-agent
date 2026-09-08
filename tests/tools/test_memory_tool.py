@@ -515,14 +515,16 @@ class TestMemoryToolDispatcher:
     def test_new_text_alias_for_content_on_add(self, store):
         result = json.loads(memory_tool(action="add", new_text="added via new_text", store=store))
         assert result["success"] is True
-        assert "added via new_text" in store.memory_entries
+        # 2026-08-06 routing: 未分类内容默认加 "⚠️未分类" 前缀（两阶段观察期，phase 1）
+        assert "⚠️未分类 added via new_text" in store.memory_entries
 
     def test_content_wins_when_both_content_and_new_text_set(self, store):
         result = json.loads(
             memory_tool(action="add", content="the real one", new_text="ignored", store=store)
         )
         assert result["success"] is True
-        assert "the real one" in store.memory_entries
+        # 2026-08-06 routing: 未分类内容默认加 "⚠️未分类" 前缀；routing 不区分 content/new_text 别名
+        assert "⚠️未分类 the real one" in store.memory_entries
         assert "ignored" not in store.memory_entries
 
 
