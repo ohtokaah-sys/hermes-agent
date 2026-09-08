@@ -378,20 +378,27 @@ class TestWeixinChunkDelivery:
 
     @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
-    @patch("gateway.platforms.weixin._read_slowlane",
-           return_value={"mode": "EXPIRED", "last_send_ts": time.time()})
-    def test_slowlane_queues_when_token_expired_and_window_busy(self, slowlane_mock, send_message_mock, sleep_mock):
-        """v2 (2026-08-19): EXPIRED 模式窗口未到 → 排队（success=False + slowlane 错误），
-        不硬发撞限流；错误文案不含 ret=-2（fallback-alert 不误计）。"""
-        adapter = self._connected_adapter()
+    def test_send_chunk_exhaust_retries_enqueues_retry(self, send_message_mock, sleep_mock):
+        """2026-08-20 补投：重试耗尽仍 rate-limit → 消息进补投队列（_retry_enqueue），不丢失。
 
-        result = asyncio.run(adapter.send("wxid_test123", "slow lane test"))
+        这是 8-08 30h 投递失败事故的最后兜底（跨进程/重启延迟补发）。
+        """
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 0  # 不重试，直接耗尽
+        adapter._send_chunk_retry_delay_seconds = 0
+
+        send_message_mock.return_value = {
+            "ret": weixin.RATE_LIMIT_ERRCODE,
+            "errcode": weixin.RATE_LIMIT_ERRCODE,
+            "errmsg": "frequency limit",
+        }
+
+        with patch("gateway.platforms.weixin._retry_enqueue") as enqueue_mock:
+            result = asyncio.run(adapter.send("wxid_test123", "will be queued"))
 
         assert result.success is False
-        assert "slowlane" in (result.error or "")
-        assert "ret=-2" not in (result.error or "")
-        # 没有真实发送尝试（等待窗口后入队）
-        assert send_message_mock.await_count == 0
+        # 重试耗尽 → 消息进补投队列（而非当场丢失）—— 8-08 事故兜底的核心断言
+        enqueue_mock.assert_called_once()
 
     @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)

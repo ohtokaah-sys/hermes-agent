@@ -1213,6 +1213,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 chunk=chunk,
                 context_token=context_token,
                 client_id=client_id,
+                source=source,
             )
 
     async def _send_text_chunk_locked(
