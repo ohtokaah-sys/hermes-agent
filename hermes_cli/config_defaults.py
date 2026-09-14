@@ -619,6 +619,13 @@ DEFAULT_CONFIG = {
         # A prune only commits when it reclaims at least this many tokens, then waits for a
         # trigger-sized runway to regrow before rearming. 0 = no minimum-savings gate.
         "proactive_prune_min_reclaim_tokens": 4096,
+        # 机械封顶（甲方案）：summary body 的字符预算 = tokens × 1.7。0 = 关闭（默认）。
+        # 开启后保底条目（路径/hash/文件名/决策/数字台账）优先占位，其余按原顺序填充。
+        "summary_cap_tokens": 0,
+        # 留给最末节（最新内容）的预留字符数，从总预算内切出；0 = 不预留。
+        "summary_cap_recent_reserve": 800,
+        # true = 走完封顶算法但只写 ~/.hermes/state/summary_cap_dryrun.jsonl，不改摘要。
+        "summary_cap_dry_run": False,
         # micro_compact: opt-in — after each turn fold the oldest un-absorbed exchange into a
         # rolling summary, amortizing compression cost. Off by default because every pass rewrites
         # sent history and breaks the prompt-cache prefix EVERY turn; enable only if the amortized

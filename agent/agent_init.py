@@ -1556,6 +1556,12 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         max_attempts=min(max_attempts, 10),
         # Opt-in proactive tool-result prune trigger (0 = disabled; negatives = disabled).
         proactive_prune_tokens=max(0, _parse_config_int(cfg.get("proactive_prune_tokens", 0), 0)),
+        # 机械封顶（甲方案）：0 = 关闭；dry_run = 走完算法但只记录，不改摘要。
+        summary_cap_tokens=max(0, _parse_config_int(cfg.get("summary_cap_tokens", 0), 0)),
+        summary_cap_recent_reserve=max(
+            0, _parse_config_int(cfg.get("summary_cap_recent_reserve", 800), 800)
+        ),
+        summary_cap_dry_run=is_truthy_value(cfg.get("summary_cap_dry_run"), default=False),
         proactive_prune_min_chars=_parse_config_int(
             cfg.get("proactive_prune_min_result_chars", 8000), 8000
         ),
@@ -1999,6 +2005,9 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             proactive_prune_tokens=cs.proactive_prune_tokens,
             proactive_prune_min_result_chars=cs.proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=cs.proactive_prune_min_reclaim,
+            summary_cap_tokens=cs.summary_cap_tokens,
+            summary_cap_recent_reserve=cs.summary_cap_recent_reserve,
+            summary_cap_dry_run=cs.summary_cap_dry_run,
             min_tail_user_messages=cs.min_tail_users, tail_mode=cs.tail_mode,
             custom_providers=_custom_providers,
         )

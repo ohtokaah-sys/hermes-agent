@@ -1007,6 +1007,9 @@ compression:
   proactive_prune_tokens: 0                         # Opt-in tokens trigger for the no-LLM tool-result prune (0 = off; see below)
   proactive_prune_min_result_chars: 8000            # Prune's summarize pass only touches tool results larger than this (clamped >= 200)
   proactive_prune_min_reclaim_tokens: 4096          # Prune only commits when it reclaims at least this many tokens (0 = commit any)
+  summary_cap_tokens: 0                             # Mechanical char cap over the LLM summary body; budget = tokens * 1.7 chars (0 = off)
+  summary_cap_recent_reserve: 800                    # Chars reserved so the newest section keeps its entries (used only when capping)
+  summary_cap_dry_run: false                         # true = log what would be dropped, return the summary unchanged
 
 # The summarization model/provider is configured under auxiliary:
 auxiliary:

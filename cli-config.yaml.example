@@ -820,6 +820,15 @@ compression:
   # instead of a tiny break on every tool iteration. 0 = commit any non-zero
   # prune. Default 4096.
   proactive_prune_min_reclaim_tokens: 4096
+  # --- Mechanical summary cap (ADR 20260914, 甲方案) ---
+  # Deterministic char cap over the LLM summary body: budget = tokens * 1.7 chars.
+  # Guard items (paths/hashes/file names/decisions/ledger numbers) claim budget first,
+  # the rest fills in original order, and the newest section may use a small reserve
+  # (summary_cap_recent_reserve chars). 0 = off (byte-identical behaviour).
+  summary_cap_tokens: 0
+  summary_cap_recent_reserve: 800
+  # true = compute and log what would be dropped, but return the summary unchanged
+  summary_cap_dry_run: false
 
   # To pin a specific model/provider for compression summaries, use the
   # auxiliary section below (auxiliary.compression.provider / model).

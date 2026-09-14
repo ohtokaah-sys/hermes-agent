@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import re
 import time
@@ -1150,6 +1151,104 @@ _MAX_KEEP_TOOL_IMAGES = 3
 _SMALL_CTX_WINDOW_LIMIT = 512_000
 _SMALL_CTX_THRESHOLD_PERCENT = 0.75
 
+
+# --- 机械封顶（甲方案；见 ADR_20260914_上下文摘要机械封顶_甲方案）------------------------------
+# Deterministic, zero-model char cap over the LLM summary body. Disabled unless
+# ``compression.summary_cap_tokens`` > 0 (0 = byte-identical to the previous behaviour).
+# 1.7 chars/token and the guard set come from the replay experiments (mg8000 arm, retention 0.91).
+_CAP_CHARS_PER_TOKEN = 1.7
+_CAP_ALERT_RATIO = 1.05
+_CAP_ALERT_STREAK_DISABLE = 3
+_CAP_ALERTS_PATH = "~/.hermes/state/summary_cap_alerts.jsonl"
+_CAP_ARCHIVE_DIR = "~/.hermes/state/summary_cap_archive"
+_CAP_DRYRUN_PATH = "~/.hermes/state/summary_cap_dryrun.jsonl"
+_CAP_GUARD_PATTERNS = [
+    re.compile(r"(?:^|\s)(?:~|/)[\w./\-]{3,}"),                        # 路径
+    re.compile(r"\b[a-f0-9]{8,}\b"),                                   # hash / id
+    re.compile(r"[\w\-]+\.(?:md|py|jsonl|json|yaml|yml|sh|db)\b"),     # 文件名
+    re.compile(r"(决策|决定|结论|未决|待裁|铁律|必须|禁止|不要|教训|Rule\s*\d+|P0|P1)"),
+    re.compile(r"\d[\d,\.]*\s*(?:字符|tok(?:en)?s?|条|行|KB|MB|GB|ms)"),
+]
+_CAP_OMIT_NOTE = "…[机械封顶：省略 {dropped} 条 / {chars} 字符（原文见 {archive}）]"
+_CAP_OMIT_MARK = "…[机械封顶：省略"
+
+
+def _cap_append_jsonl(path: str, record: Dict[str, Any]) -> str:
+    """Best-effort append-only JSONL write; never raises into the summary path."""
+    try:
+        target = os.path.expanduser(path)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return target
+    except Exception:
+        logger.warning("Summary cap: failed to append %s", path, exc_info=True)
+        return ""
+
+
+def _cap_parse_sections(text: str) -> List[Dict[str, Any]]:
+    """机械枚举全文 `^## ` 节（禁白名单遍历，未识别节默认进兜底组）"""
+    secs, cur = [], {"head": "(pre)", "lines": []}
+    for line in text.split("\n"):
+        if line.startswith("## "):
+            secs.append(cur)
+            cur = {"head": line.strip(), "lines": []}
+        else:
+            cur["lines"].append(line)
+    secs.append(cur)
+    return [s for s in secs if s["lines"] or s["head"] != "(pre)"]
+
+
+def _cap_split_items(lines: List[str]) -> List[str]:
+    """条目切分：空行分段 + 列表项独立 + 续行归并 + 代码块排除"""
+    out, buf, in_code = [], [], False
+    for line in lines:
+        if line.strip().startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        if not line.strip():
+            if buf:
+                out.append("\n".join(buf))
+                buf = []
+            continue
+        if line.lstrip().startswith(("-", "*", "•", "###")) and buf:
+            out.append("\n".join(buf))
+            buf = [line]
+        elif re.match(r"^\s*\d+[.)]\s", line) and buf:
+            out.append("\n".join(buf))
+            buf = [line]
+        else:
+            buf.append(line)
+    if buf:
+        out.append("\n".join(buf))
+    return [p.strip() for p in out if p.strip()]
+
+
+def _cap_build_items(secs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    items = []
+    for si, s in enumerate(secs):
+        for it in _cap_split_items(s["lines"]):
+            items.append({"sec": si, "head": s["head"], "text": it})
+    return items
+
+
+def _cap_guard_hit(text: str) -> bool:
+    return any(p.search(text) for p in _CAP_GUARD_PATTERNS)
+
+
+def _cap_render(items: List[Dict[str, Any]], keep: set) -> str:
+    """按原顺序拼回：节标题只出现一次 + 被选中条目原文照搬"""
+    out, cur = [], None
+    for i, it in enumerate(items):
+        if i not in keep:
+            continue
+        if it["head"] != cur:
+            out.append(it["head"])
+            cur = it["head"]
+        out.append(it["text"])
+    return "\n".join(out)
 
 _PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")
 
@@ -2808,6 +2907,7 @@ class ContextCompressor(
         model_thresholds: dict[str, float] | None = None, threshold_tokens_cap: Any = None,
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
+        summary_cap_tokens: int = 0, summary_cap_recent_reserve: int = 800, summary_cap_dry_run: bool = False,
         custom_providers: list | None = None,
     ):
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
@@ -2836,6 +2936,11 @@ class ContextCompressor(
         self.proactive_prune_min_reclaim_tokens = max(0, int(proactive_prune_min_reclaim_tokens or 0))
         # A committed prune is a cache boundary: rearm only after the prompt regrows the reclaimed tokens.
         self._proactive_prune_rearm_tokens: int = 0
+        # 机械封顶（甲方案）：0 = 关闭（零行为差异）；dry_run = 只记录不裁剪。
+        self.summary_cap_tokens = max(0, int(summary_cap_tokens or 0))
+        self.summary_cap_recent_reserve = max(0, int(summary_cap_recent_reserve or 0))
+        self.summary_cap_dry_run = bool(summary_cap_dry_run)
+        self._summary_cap_alert_streak: int = 0
         # Dedup key for the over-threshold "reclamation no-oped" warning
         # (#101889) so a tool loop riding above the threshold warns once per
         # distinct reason + rearm snapshot instead of every iteration.
@@ -3678,7 +3783,110 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             logger.info("Lean tail: demoted %d stale tool result(s)", demoted)
         return result
 
-    def _augment_summary_lean(self, summary: str, turns_to_summarize: list[dict[str, Any]]) -> str:
+
+    def _cap_summary_body(self, summary: str, turns_to_summarize: List[Dict[str, Any]]) -> str:
+        """Deterministic char-budget cap over the LLM summary body (甲方案, ADR_20260914).
+
+        Zero model calls: guard items (paths / hashes / filenames / decisions / ledger numbers)
+        claim the budget first, the remaining items fill in original order, and the last section
+        may draw on a small reserve kept back for the newest content. ``summary_cap_tokens: 0``
+        returns the input unchanged (byte-identical); ``summary_cap_dry_run`` only records what
+        would be dropped.
+        """
+        cap_tokens = int(getattr(self, "summary_cap_tokens", 0) or 0)
+        if cap_tokens <= 0 or not summary:
+            return summary
+        if _CAP_OMIT_MARK in summary:
+            # 封顶是一次性：已封顶文本不再二次裁剪（保证 cap(cap(x)) == cap(x)，且避免多轮啃薄）
+            return summary
+        budget_chars = int(cap_tokens * _CAP_CHARS_PER_TOKEN)
+        reserve_chars = max(0, int(getattr(self, "summary_cap_recent_reserve", 0) or 0))
+        session_id = getattr(self, "_session_id", "") or ""
+        try:
+            items = _cap_build_items(_cap_parse_sections(summary))
+            if not items:
+                return summary
+            guard_idx = [i for i, it in enumerate(items) if _cap_guard_hit(it["text"])]
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+            sha_before = hashlib.sha256(summary.encode("utf-8")).hexdigest()
+            fill_budget = max(0, budget_chars - reserve_chars)
+            keep, used, guard_dropped = set(), 0, 0
+            for i in guard_idx:                       # ① 机械保底优先占位
+                t = items[i]["text"]
+                if used + len(t) <= fill_budget:
+                    keep.add(i)
+                    used += len(t)
+                else:
+                    guard_dropped += 1
+            for i, it in enumerate(items):            # ② 顺序填充（实验口径：全表贪心；Q4 兜底与之内同构）
+                if i in keep:
+                    continue
+                if used + len(it["text"]) <= fill_budget:
+                    keep.add(i)
+                    used += len(it["text"])
+            if reserve_chars:                         # ③ 预留池只补给最末节（Q7，余额不回填）
+                last_sec = max(it["sec"] for it in items)
+                limit = used + reserve_chars
+                for i, it in enumerate(items):
+                    if i in keep or it["sec"] != last_sec:
+                        continue
+                    if used + len(it["text"]) <= limit:
+                        keep.add(i)
+                        used += len(it["text"])
+            dropped = [it["text"] for i, it in enumerate(items) if i not in keep]
+            dropped_chars = sum(len(t) for t in dropped)
+            if getattr(self, "summary_cap_dry_run", False):
+                _cap_append_jsonl(_CAP_DRYRUN_PATH, {
+                    "ts": stamp, "session_id": session_id, "sha256_before": sha_before,
+                    "budget_chars": budget_chars, "reserve_chars": reserve_chars,
+                    "items_total": len(items), "would_keep": len(keep),
+                    "would_drop": len(dropped), "would_drop_chars": dropped_chars,
+                    "guard_total": len(guard_idx), "guard_dropped": guard_dropped,
+                    "would_shrink_pct": round(100.0 * dropped_chars / max(1, len(summary)), 1),
+                })
+                return summary
+            body = _cap_render(items, keep)
+            if len(body) > budget_chars * _CAP_ALERT_RATIO:
+                streak = int(getattr(self, "_summary_cap_alert_streak", 0) or 0) + 1
+                self._summary_cap_alert_streak = streak
+                logger.warning("Summary cap: body %d chars over budget %d (streak %d)",
+                               len(body), budget_chars, streak)
+                _cap_append_jsonl(_CAP_ALERTS_PATH, {
+                    "ts": stamp, "session_id": session_id, "body_chars": len(body),
+                    "budget_chars": budget_chars, "streak": streak,
+                })
+                if streak >= _CAP_ALERT_STREAK_DISABLE:
+                    logger.warning("Summary cap: %d consecutive over-budget alerts — disabling "
+                                   "for this process", streak)
+                    self.summary_cap_tokens = 0
+                    return summary
+            else:
+                self._summary_cap_alert_streak = 0
+            if dropped:
+                archive_path = ("%s/%s/%s_%s.jsonl" % (
+                    _CAP_ARCHIVE_DIR, time.strftime("%Y-%m-%d"),
+                    session_id or "unknown", time.strftime("%H%M%S")))
+                archive_file = _cap_append_jsonl(archive_path, {
+                    "ts": stamp, "session_id": session_id, "budget_chars": budget_chars,
+                    "sha256_before": sha_before,
+                    "sha256_after": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                    "dropped_count": len(dropped), "dropped_chars": dropped_chars,
+                    "dropped": dropped,
+                })
+                body += "\n\n" + _CAP_OMIT_NOTE.format(
+                    dropped=len(dropped), chars=dropped_chars, archive=archive_file or "(归档失败)")
+            self._last_summary_cap_stats = {
+                "items": len(items), "kept": len(keep), "dropped": len(dropped),
+                "guard_total": len(guard_idx), "guard_dropped": guard_dropped,
+                "budget_chars": budget_chars, "used": used,
+            }
+            return body
+        except Exception:
+            logger.warning("Summary cap: failed — returning uncapped summary", exc_info=True)
+            return summary
+
+    def _augment_summary_lean(self, summary: str, turns_to_summarize: List[Dict[str, Any]]) -> str:
+
         """Append deterministic lean-mode sections to a summary; no-op in legacy mode."""
         if getattr(self, "tail_mode", "lean") != "lean":
             return summary
@@ -4023,6 +4231,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             # See #32106.
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
+            summary = self._cap_summary_body(summary, turns_to_summarize)
             summary = self._augment_summary_lean(summary, turns_to_summarize)
             self._validate_summary_user_provenance(summary, has_user_turn)
             # A detached stale attempt must not publish its late summary onto shared compressor state:
