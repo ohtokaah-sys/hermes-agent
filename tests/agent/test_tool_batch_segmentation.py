@@ -584,7 +584,7 @@ class TestSegmentedDispatchIntegration:
         def fake_handle(name, args, task_id, **kwargs):
             if kwargs["tool_call_id"].endswith("large"):
                 assert agent.steer("preserve this steer after budget enforcement")
-                return "L" * 1_000
+                return "L" * 5_000
             return "small"
 
         with (
@@ -602,9 +602,12 @@ class TestSegmentedDispatchIntegration:
     def test_steer_survives_turn_budget_after_malformed_arguments(self, agent):
         """Malformed arguments still reach the shared post-budget finalizer.
 
-        The parser error itself can exceed a constrained turn budget.  A steer
-        queued before that malformed sequential call must therefore remain
-        pending until after the error result is replaced by the budget preview.
+        The parser error result is SMALLER than the persisted-output block (which carries the
+        local payload-access guidance, so its fixed overhead exceeds this ~116-char error), so the
+        shrink gate correctly leaves it in place — swapping it in would GROW the turn's context,
+        the opposite of this layer's job.  What this test pins is the ORDER: a steer queued before
+        the malformed sequential call must still remain pending until after the post-budget
+        finalizer has run.
         """
         calls = [_tc("terminal", "{not json", call_id="malformed")]
         messages = []
@@ -622,7 +625,11 @@ class TestSegmentedDispatchIntegration:
             agent._execute_tool_calls(msg, messages, "task-1")
 
         assert len(messages) == 2
-        _assert_budget_replaced(messages[0]["content"])
+        # Shrink gate (local, 2026-09-15): NOT replaced — the persisted block is larger than this
+        # ~116-char parser error, so enforcement correctly leaves it alone. The order below is what
+        # this test pins.
+        assert PERSISTED_OUTPUT_TAG not in messages[0]["content"]
+        assert "Invalid tool arguments" in messages[0]["content"]
         assert STEER_MARKER_OPEN not in messages[0]["content"]   # tool row untouched
         assert messages[1]["role"] == "user"                      # steer = new user msg
         assert messages[1]["content"].count(STEER_MARKER_OPEN) == 1

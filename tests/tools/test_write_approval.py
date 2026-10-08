@@ -315,7 +315,8 @@ def test_memory_inline_approve_writes(hermes_home, approval_callback_cleanup):
     r = json.loads(memory_tool("add", "memory", "approved fact", store=store))
     assert r["success"] is True
     assert r.get("staged") is None  # real write, not staged
-    assert store.memory_entries == ["approved fact"]
+    # 本地写入分流可能加 "⚠️未分类 " 前缀（CI 2607 两阶段观察期），断言用子串
+    assert any("approved fact" in e for e in store.memory_entries)
     assert wa.pending_count("memory") == 0
     # The registered callback must actually be invoked (not the input() path).
     assert len(calls) == 1

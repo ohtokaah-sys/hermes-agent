@@ -453,7 +453,16 @@ def _home_env_lookup(env_var: str, suffix: str = "", *, strip: bool = False) -> 
         get_secret = None  # type: ignore
 
     def read(name: str) -> str:
-        value = (get_secret(name, "") or "") if get_secret is not None else os.getenv(name, "")
+        if get_secret is not None:
+            try:
+                value = get_secret(name, "") or ""
+            except Exception:
+                # Multiplex fail-closed (UnscopedSecretError) or any read error → empty string.
+                # Never fall back to os.getenv here: that would leak another profile's value,
+                # the exact hole the fail-closed scope exists to prevent (gateway/AGENTS.md).
+                value = ""
+        else:
+            value = os.getenv(name, "")
         return value.strip() if strip else value
 
     value = read(env_var + suffix)
@@ -924,8 +933,8 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", suffix=".txt", prefix="hermes-cron-botchat-", delete=False,
         ) as fh:
+            query_file = fh.name  # capture before write: finally must unlink even if write fails
             fh.write(message)
-            query_file = fh.name
 
         argv += [
             "chat", "--in", "~", "-c", "Bot Chat", "--create-if-missing",
@@ -1445,7 +1454,7 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
         route_thread_id = None
         route_metadata = {
             "direct_messages_topic_id": str(thread_id), "job_id": job["id"],
-            "notify": t.notify_delivery,
+            "notify": t.notify_delivery, "source": "cron",
         }
         media_metadata = {"direct_messages_topic_id": str(thread_id), "notify": t.notify_delivery}
     else:
@@ -1455,7 +1464,7 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
         # thread_id is absent from metadata; cron deliveries have no inbound reply anchor, so the metadata
         # key bypasses that check and lets the adapter route via a plain message_thread_id. See #52060.
         route_thread_id = str(thread_id) if thread_id is not None else None
-        route_metadata = {"job_id": job["id"], "notify": t.notify_delivery}
+        route_metadata = {"job_id": job["id"], "notify": t.notify_delivery, "source": "cron"}
         if route_thread_id:
             route_metadata["thread_id"] = route_thread_id
         media_metadata = {"notify": t.notify_delivery}
@@ -1548,6 +1557,25 @@ def _live_send_text(
     send_success = _confirm_adapter_delivery(send_result, job["id"], _evidence_gap)
     if send_success and _evidence_gap:
         unverified_targets.append(t.where)
+
+    # 2026-09-15: **推迟不是失败** —— 适配器已把消息安全落入持久补投队列（weixin 夜间
+    # token 过期场景：数字小时无人对话 → context_token 失效 → 冷推 ret=-2），drain 会补发，
+    # 消息不会丢。此时【不】记投递失败 —— 否则 job 被记 ``delivery_failed``，心跳哨兵会对
+    # 「实际已送达」的消息持续误报（报警失真：真故障被淹在假警报里）。
+    # 与 ``cron.delivery_queue._terminalize_wait_timeout`` 同一条已确立的原则：
+    #   "That is a deferral, not a failure: report success so the job is not recorded
+    #    ``delivery_failed`` for a message the drain will still send."
+    # 仍记 WARNING 保可观测性（不静音）。
+    if not send_success and getattr(send_result, "deferred", False):
+        _deferred_err = getattr(send_result, "error", None) or "deferred to retry queue"
+        logger.warning(
+            "Job '%s': live adapter send to %s deferred to retry queue "
+            "(not a failure; the drain will send it): %s",
+            job["id"], t.where, _deferred_err,
+        )
+        # 返回 ok=True：文本已交给队列 ⇒ 不走 standalone（否则会立刻重发同一条、并记一次
+        # 真失败，正好抵消本机制）。message_id=None 表示本次没有落地的消息 id。
+        return True, False, None
 
     if not send_success:
         if send_result is None:
@@ -1803,6 +1831,23 @@ def _queue_for_live_reconnect(t: _TargetDelivery, content: str, media_files: lis
     logger.warning("Job '%s': %s", t.job.get("id"), note)
     delivery_errors.append(note)
 
+#: 瞬态/可重试的投递错误标记（**推迟，不是失败**）。
+#: 实测来源（CI 3.5-A, 2026-09-15）：deliveries 表 88/88 条 failed 全是
+#: `iLink sendmessage rate limited: ret=-2 errmsg=prepare failed` —— 微信夜间无人对话
+#: → context_token 失效 → 冷推 ret=-2（代码注释里早已写明的场景）。
+#: ⚠️ 故意**不含**泛化的 "timed out"：超时的发送结果可能是"已发出但未确认"，
+#: 补投会造成**重复投递**；只有"确定没发出去"的瞬态错误才适合推迟。
+_RETRYABLE_DELIVERY_MARKERS = (
+    "rate limited", "ret=-2", "retry after", "busy",
+)
+
+
+def _is_retryable_delivery_error(err) -> bool:
+    """True = 确定没发出去的瞬态错误 ⇒ 应落补投队列（推迟），而非终态 `failed`。"""
+    e = str(err or "").lower()
+    return any(m in e for m in _RETRYABLE_DELIVERY_MARKERS)
+
+
 
 def _deliver_standalone(
     t: _TargetDelivery, content: str, media_files: list, target_errors: list, delivery_errors: list,
@@ -1820,6 +1865,25 @@ def _deliver_standalone(
         # Not inside an except block — the error comes from the result dict, no traceback.
         err = f"delivery error: {result['error']} (target {t.where})"
         logger.error("Job '%s': %s", job["id"], err)
+    if err is not None and _is_retryable_delivery_error(err) and str(job.get("execution_id") or ""):
+        # 丙① 修复（CI 3.5-A, 2026-09-15）：**「推迟不是失败」必须覆盖 standalone 回退这条路**。
+        # 修复前：`deferred` 分支只存在于 live adapter 那条路；一旦 60s 超时回退到 standalone，
+        # 瞬态错误（ret=-2 限速）被**终态化成 failed** ⇒ 消息真丢（实测 pending=0）。
+        # 修复后：入**持久补投队列**（`enqueue`，execution_id 为主键 ⇒ 幂等），本次按"推迟"返回；
+        # drain 会在网关可用时补发。真错误（凭据/目标不存在等）仍走下面的原路径上报。
+        # for_failure 传 False：失败类通知的推迟补发按普通消息送达，内容不变。
+        try:
+            from cron.delivery_queue import enqueue
+
+            enqueue(str(job["execution_id"]), job, content, for_failure=False)
+            logger.warning(
+                "Job '%s': standalone send to %s hit a transient error and was queued "
+                "for retry (not a failure; the drain will send it): %s",
+                job["id"], t.where, err)
+            return
+        except Exception as _qe:
+            logger.error("Job '%s': deferring delivery failed, falling back to reporting: %s",
+                         job["id"], _qe)
     if err is not None:
         target_errors.append(err)
         delivery_errors.extend(target_errors)

@@ -1077,3 +1077,145 @@ class TestWeixinDeliveryOptimization:
         assert adapter._send_text_chunk is not None
         # 合并累计上限 1800 → 1999 会被拆成多块，但不应触发 MD 路径
         assert len(sent) >= 1
+
+
+class TestWeixinMediaRetCheck:
+    """iLink 业务失败码校验（2026-09-14；队列 2026-08-26「MEDIA 投递静默丢件」）。
+
+    不变量：``_send_file`` 绝不把 iLink 的 ret/errcode 非 0 当作成功；会话过期
+    （ret=-2 / errcode=-14）自动去掉 context_token 重发一次；重发仍失败则抛错，
+    而不是返回一个伪造的 message_id 让上层记 success。
+    """
+
+    class _UploadResponse:
+        def __init__(self):
+            self.status = 200
+            self.headers = {"x-encrypted-param": "enc-param"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def read(self):
+            return b""
+
+        async def text(self):
+            return ""
+
+    class _RecordingSession:
+        def __init__(self):
+            self.post_calls = []
+
+        def post(self, url, **kwargs):
+            self.post_calls.append((url, kwargs))
+            return TestWeixinMediaRetCheck._UploadResponse()
+
+    def _ready_adapter(self, tmp_path, context_token="ctx-token"):
+        adapter = _make_adapter()
+        session = self._RecordingSession()
+        adapter._session = session
+        adapter._send_session = session
+        adapter._token = "test-token"
+        adapter._base_url = "https://weixin.example.com"
+        adapter._cdn_base_url = "https://cdn.example.com/c2c"
+        adapter._token_store = ContextTokenStore(hermes_home=str(tmp_path))
+        adapter._token_store.get = lambda account_id, chat_id: context_token
+        return adapter, session
+
+    def _media_file(self, tmp_path):
+        path = tmp_path / "demo.png"
+        path.write_bytes(b"fake-png-bytes")
+        return path
+
+    def _patches(self, upload=None, send_items=None):
+        return (
+            patch(
+                "gateway.platforms.weixin._get_upload_url",
+                new=AsyncMock(return_value=upload if upload is not None else {"upload_full_url": "https://upload.example.com/media"}),
+            ),
+            patch("gateway.platforms.weixin._send_items", new=send_items),
+        )
+
+    def test_nonzero_ret_raises_instead_of_returning_fake_id(self, tmp_path):
+        adapter, _ = self._ready_adapter(tmp_path)
+        media = self._media_file(tmp_path)
+        send_items = AsyncMock(return_value={"ret": -9999, "errmsg": "boom"})
+        p1, p2 = self._patches(send_items=send_items)
+        with p1, p2:
+            with pytest.raises(RuntimeError) as exc:
+                asyncio.run(adapter._send_file("wxid_test123", str(media), ""))
+        assert "-9999" in str(exc.value)
+        assert send_items.await_count == 1
+
+    def test_success_path_sends_once(self, tmp_path):
+        adapter, _ = self._ready_adapter(tmp_path)
+        media = self._media_file(tmp_path)
+        send_items = AsyncMock(return_value={"ret": 0})
+        p1, p2 = self._patches(send_items=send_items)
+        with p1, p2:
+            message_id = asyncio.run(adapter._send_file("wxid_test123", str(media), ""))
+        assert message_id.startswith("hermes-weixin-")
+        assert send_items.await_count == 1
+
+    def test_session_expired_retries_tokenless_once(self, tmp_path):
+        adapter, _ = self._ready_adapter(tmp_path)
+        media = self._media_file(tmp_path)
+        send_items = AsyncMock(side_effect=[{"ret": -2, "errmsg": "unknown error"}, {"ret": 0}])
+        p1, p2 = self._patches(send_items=send_items)
+        with p1, p2:
+            message_id = asyncio.run(adapter._send_file("wxid_test123", str(media), ""))
+        assert message_id.startswith("hermes-weixin-")
+        assert send_items.await_count == 2
+        assert send_items.await_args_list[0].kwargs["context_token"] == "ctx-token"
+        assert send_items.await_args_list[1].kwargs["context_token"] is None
+
+    def test_err_14_also_retries_tokenless(self, tmp_path):
+        adapter, _ = self._ready_adapter(tmp_path)
+        media = self._media_file(tmp_path)
+        send_items = AsyncMock(side_effect=[{"errcode": -14, "errmsg": "session invalid"}, {"ret": 0}])
+        p1, p2 = self._patches(send_items=send_items)
+        with p1, p2:
+            asyncio.run(adapter._send_file("wxid_test123", str(media), ""))
+        assert send_items.await_count == 2
+
+    def test_tokenless_retry_failure_raises(self, tmp_path):
+        adapter, _ = self._ready_adapter(tmp_path)
+        media = self._media_file(tmp_path)
+        send_items = AsyncMock(side_effect=[{"ret": -2, "errmsg": "unknown error"}] * 2)
+        p1, p2 = self._patches(send_items=send_items)
+        with p1, p2:
+            with pytest.raises(RuntimeError):
+                asyncio.run(adapter._send_file("wxid_test123", str(media), ""))
+        assert send_items.await_count == 2
+
+    def test_no_context_token_does_not_retry(self, tmp_path):
+        adapter, _ = self._ready_adapter(tmp_path, context_token=None)
+        media = self._media_file(tmp_path)
+        send_items = AsyncMock(return_value={"ret": -2, "errmsg": "unknown error"})
+        p1, p2 = self._patches(send_items=send_items)
+        with p1, p2:
+            with pytest.raises(RuntimeError):
+                asyncio.run(adapter._send_file("wxid_test123", str(media), ""))
+        assert send_items.await_count == 1
+
+    def test_upload_url_error_raises_before_upload(self, tmp_path):
+        adapter, session = self._ready_adapter(tmp_path)
+        media = self._media_file(tmp_path)
+        send_items = AsyncMock(return_value={"ret": 0})
+        p1, p2 = self._patches(upload={"ret": -2, "errmsg": "unknown error"}, send_items=send_items)
+        with p1, p2:
+            with pytest.raises(RuntimeError):
+                asyncio.run(adapter._send_file("wxid_test123", str(media), ""))
+        assert session.post_calls == []
+        assert send_items.await_count == 0
+
+    def test_caption_error_raises(self, tmp_path):
+        adapter, _ = self._ready_adapter(tmp_path)
+        media = self._media_file(tmp_path)
+        send_items = AsyncMock(return_value={"ret": -9999, "errmsg": "nope"})
+        p1, p2 = self._patches(send_items=send_items)
+        with p1, p2:
+            with pytest.raises(RuntimeError):
+                asyncio.run(adapter._send_file("wxid_test123", str(media), "说明文字"))

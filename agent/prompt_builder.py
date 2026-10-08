@@ -1355,8 +1355,7 @@ def _current_session_platform_hint() -> str:
 
 def build_skills_system_prompt(
     available_tools: set[str] | None = None, available_toolsets: set[str] | None = None,
-    compact_categories: frozenset[str] | None = None, skills_dir_override: Path | None = None,
-) -> str:
+    compact_categories: frozenset[str] | None = None, skills_dir_override: Path | None = None,) -> str:
     """Compact skill index for the system prompt.
 
     Same-named skills resolve like skill_view: project > local > create_dir > external_dirs, and a
@@ -1427,8 +1426,7 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
 
 def _render_skills_index(
     skills_by_category: dict[str, list[tuple[str, str]]], category_descriptions: dict[str, str],
-    compact_categories: frozenset[str] | None, available_tools: set[str] | None, unloadable: list[str] = (),
-) -> str:
+    compact_categories: frozenset[str] | None, available_tools: set[str] | None, unloadable: list[str] = (),) -> str:
     """Render the ## Skills block; "" when there is nothing to list. *unloadable* names (different skills
     sharing a name AND relative path within one tier — one root or several) get a rename note instead of a row skill_view would refuse."""
     if not skills_by_category:
@@ -1448,6 +1446,7 @@ def _render_skills_index(
     # Don't name web_search when the session has no web tools (dangling reference).
     _basic_tools = "terminal" if available_tools is not None and "web_search" not in available_tools else "web_search or terminal"
     index_lines = []
+    folded_any = False
     for category in sorted(skills_by_category):
         entries = skills_by_category[category]
         if category in demoted:
@@ -1456,10 +1455,17 @@ def _render_skills_index(
         cat_desc = category_descriptions.get(category, "")
         index_lines.append(f"  {category}: {cat_desc}" if cat_desc else f"  {category}:")
         seen = set()
+        folded: list[str] = []
         for name, desc in sorted(entries, key=lambda x: x[0]):  # stable: first entry per name wins
             if name not in seen:
                 seen.add(name)
+                if compact_skills and name in compact_skills:
+                    folded.append(name)   # 11.3: 名字仍可见，只省略描述
+                    folded_any = True
+                    continue
                 index_lines.append(f"    - {name}: {desc}" if desc else f"    - {name}")
+        if folded:
+            index_lines.append(f"    - [names only]: {', '.join(sorted(folded))}")
     from agent.oneshot_footprint import ONESHOT_SKILLS_LOAD_GUIDANCE, is_single_query_session
     if is_single_query_session():
         return (
@@ -1467,6 +1473,10 @@ def _render_skills_index(
             + "\n<available_skills>\n" + "\n".join(index_lines) + "\n</available_skills>"
             + hidden_note
         )
+    folded_note = (
+        "\n(Entries marked [names only] load normally with skill_view(name) — only their one-line "
+        "description is omitted to keep the index small.)"
+    ) if folded_any else ""
     return (
         "## Skills\n"
         "Before replying, scan the skills below. If a skill matches or is even partially relevant to your "
@@ -1486,7 +1496,7 @@ def _render_skills_index(
         + "\n".join(index_lines) + "\n"
         "</available_skills>\n\n"
         "Only proceed without loading a skill if genuinely none are relevant to the task."
-        + hidden_note
+        + hidden_note + folded_note
     )
 
 
@@ -1497,8 +1507,7 @@ def _oneshot_prompt_variant() -> bool:
 
 def _build_skills_system_prompt_inner(
     skills_dir: Path, extra_roots: list[tuple[int, Path]], available_tools: set[str] | None,
-    available_toolsets: set[str] | None, compact_categories: frozenset[str] | None,
-) -> str:
+    available_toolsets: set[str] | None, compact_categories: frozenset[str] | None,) -> str:
     # The resolved platform is part of the key: per-platform disabled-skill lists need distinct cache entries.
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
@@ -1516,8 +1525,7 @@ def _build_skills_system_prompt_inner(
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
-        _oneshot_prompt_variant(), tuple(plugin_rows),
-    )
+        _oneshot_prompt_variant(), tuple(plugin_rows),    )
     snapshot = _load_skills_snapshot(skills_dir, manifest)
     app_gated = snapshot is not None and any(
         entry.get("requires_apps") for entry in snapshot.get("skills", []) if isinstance(entry, dict)

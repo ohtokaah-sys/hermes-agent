@@ -324,10 +324,11 @@ def _open_in_editor(initial: str, *, suffix: str) -> Optional[str]:
     import tempfile
 
     editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
-    with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False, encoding="utf-8") as fh:
-        fh.write(initial)
-        path = fh.name
+    fh = tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False, encoding="utf-8")
+    path = fh.name
     try:
+        fh.write(initial)
+        fh.close()
         subprocess.call([*editor.split(), path])
         with open(path, encoding="utf-8-sig") as fh:
             return fh.read()

@@ -84,12 +84,13 @@ class TestSemanticMatch:
         assert r["matched"] == 1
         assert "条目零" in r["content"]
 
-    def test_cap_at_20(self, mock_api):
-        # 20 条上限（P048 review E1）
-        big = "\n§\n".join(f"条目{i}" for i in range(30))
-        mock_api.append("[" + ",".join(str(i) for i in range(30)) + "]")
+    def test_cap_at_max_entries(self, mock_api):
+        # 上限 = _MAX_ENTRIES（2026-09-17 起由硬编码 20 改为可配，默认 40）
+        n = msf._MAX_ENTRIES
+        big = "\n§\n".join(f"条目{i}" for i in range(n + 10))
+        mock_api.append("[" + ",".join(str(i) for i in range(n + 10)) + "]")
         r = msf.semantic_match("q", big, "memory")
-        assert r["matched"] == 20
+        assert r["matched"] == n
 
     def test_empty_array_is_success(self, mock_api):
         # 合法空 [] → 返回 None 但不算失败（退避不累加）

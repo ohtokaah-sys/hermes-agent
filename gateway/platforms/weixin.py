@@ -11,6 +11,222 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse
 
+from hermes_constants import get_hermes_home
+
+_HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+
+_TABLE_RULE_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
+
+_FENCE_RE = re.compile(r"^```([^\n`]*)\s*$")
+
+class _SessionExpiredError(RuntimeError):
+    """iLink 报告会话过期（ret=-2 / errcode=-14）——调用方去掉 ``context_token`` 重发即可。"""
+
+def _raise_on_ilink_error(resp: Any, *, what: str) -> None:
+    """校验 iLink 的业务返回：HTTP 200 也可能带 ``ret``/``errcode`` 失败码。
+
+    2026-09-14（队列 2026-08-26「MEDIA 投递静默丢件」）：媒体发送路径此前完全不看这两个
+    字段——token 过期时 ``_send_items`` 返回错误体，``_send_file`` 照样返回一个伪造的
+    ``message_id``，上层记 success，用户实际什么都没收到且没有任何告警。
+    非 0 一律抛错：会话过期抛 :class:`_SessionExpiredError`（可去 token 重发），其余抛
+    ``RuntimeError``（宁报错不静默）。
+    """
+    if not isinstance(resp, dict):
+        return
+    ret, errcode = resp.get("ret"), resp.get("errcode")
+    if (ret is None or ret == 0) and (errcode is None or errcode == 0):
+        return
+    errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
+    detail = f"iLink {what} error: ret={ret} errcode={errcode} errmsg={errmsg}"
+    if _is_session_expired(resp, ret, errcode):
+        exc = _SessionExpiredError(detail)
+        exc.ret, exc.errcode, exc.errmsg = ret, errcode, errmsg
+        raise exc
+    raise RuntimeError(detail)
+
+_SLOWLANE_MIN_INTERVAL = float(os.getenv("WEIXIN_SLOWLANE_INTERVAL", "150"))  # 秒; 0=禁用
+
+_SLOWLANE_WAIT_MAX = float(os.getenv("WEIXIN_SLOWLANE_WAIT_MAX", "240"))      # 秒
+
+def _slowlane_path() -> Path:
+    return Path(get_hermes_home()) / "state" / "weixin_slowlane.json"
+
+def _read_slowlane() -> Dict[str, Any]:
+    """读慢速状态。文件缺失/损坏 → FRESH（不干预正常模式）。
+
+    v2 修订: 事件驱动为主、probe 兜底——文件缺失时没有"已过期"证据，不慢速；
+    真正过期由第一次 ret=-2 事件翻转 EXPIRED（_write_slowlane），probe(5h) 周期性兜底。
+    2026-08-21: slowlane 退役后此函数保留（读旧文件兼容），实际不再产生新状态。
+    """
+    try:
+        with open(_slowlane_path()) as _f:
+            return json.load(_f)
+    except Exception:
+        return {"mode": "FRESH", "last_send_ts": 0.0}
+
+def _write_slowlane(mode: str, by: str) -> None:
+    """2026-08-21 清理: slowlane 退役，写入 no-op（状态文件已删，防止复活）。
+    这是 ADR 决策（非 bug），review 发现点评此为何「功能移除而非根因修复」——但退役是刻意为之，
+    若未来要恢复慢速通道请先查 ADR_20260819/注册表 T04D slowlane 相关决策。"""
+    return
+    try:
+        payload = {"mode": mode, "last_send_ts": time.time(), "updated_by": by}
+        p = _slowlane_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _tmp = p.with_suffix(".tmp")
+        _tmp.write_text(json.dumps(payload), encoding="utf-8")
+        _tmp.replace(p)
+    except Exception:
+        pass
+
+def _update_last_send_ts() -> None:
+    """2026-08-21 清理: slowlane 退役，写入 no-op（防止状态文件复活）。"""
+    return
+    try:
+        data = _read_slowlane()
+        data["last_send_ts"] = time.time()
+        data["updated_by"] = "send"
+        p = _slowlane_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _tmp = p.with_suffix(".tmp")
+        _tmp.write_text(json.dumps(data), encoding="utf-8")
+        _tmp.replace(p)
+    except Exception:
+        pass
+
+_RETRY_QUEUE_MAX = 100
+
+_RETRY_TTL_SECONDS = 7 * 24 * 3600
+
+_RETRY_MAX_ATTEMPTS = 3           # A方案: attempts>3 转挂起（不再占用慢速窗口）
+
+_RETRY_SUSPEND_TTL = 24 * 3600    # A方案: 挂起 24h 仍无唤醒信号 → 写死信归档（不删内容）
+
+_RETRY_SUSPEND_FALLBACK = 30 * 60 # A方案: 挂起 30min 兜底唤醒试一次
+
+_retry_path = str(Path(get_hermes_home()) / "state" / "weixin_retry.jsonl")
+
+class _DeferredToRetryQueue(Exception):
+    """发送本轮失败，但消息已安全落入补投队列（drain 会补发）——**推迟，不是失败**。
+
+    2026-09-15：给 cron 层一个可区分的信号，使 job 不因「夜间 token 过期 → 补投」被记成
+    ``delivery_failed``（现状：消息实际送达，心跳却报失败 ⇒ 报警失真）。
+    与非本异常的其它 ``Exception`` 必须区别对待：真失败仍走原路（记 delivery_failed）。
+    """
+
+def _retry_enqueue(to: str, text: str, source: str = "cron") -> bool:
+    """入补投队列（幂等: 同 id 已存在则 attempts+1，不新增行）。失败静默。
+
+    A方案 (2026-08-21): source 区分对话回复(response)与 cron 推送。
+    - 对话回复（response）豁免硬上限：不转挂起（最高价值消息，须必达）。
+    - cron 推送：attempts > _RETRY_MAX_ATTEMPTS → 转挂起（status=suspended，
+      不再占用慢速窗口，等唤醒信号或 30min 兜底，24h 归档，不丢内容）。
+
+    返回（2026-09-15 新增）：``True`` = 本条以 **active** 落盘（drain 会补发，属"必达的推迟"）；
+    ``False`` = 入队失败，或本条被转为 **suspended**（有 24h 转死信的风险，**不**视为必达）。
+    调用方据此区分「推迟」与「失败」——收紧判定，避免把可能永不送达的消息记成 ok。
+    """
+    try:
+        # 幂等去重 key（非安全边界）: sha1 截断 16 hex 用于队列内去重；队列上限 100 条，
+        # 64-bit 碰撞概率 ~1e-12 可忽略。review 曾误标为 SHA-1 安全缺陷——此为去重非加密用途。
+        mid = hashlib.sha1(f"{to}|{text}".encode()).hexdigest()[:16]
+        lines: List[str] = []
+        if Path(_retry_path).exists():
+            with open(_retry_path) as _f:
+                lines = [_l for _l in _f if _l.strip()]
+        now = time.time()
+        found = False
+        out: List[Dict[str, Any]] = []
+        for line in lines[-_RETRY_QUEUE_MAX:]:
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            if now - float(item.get("ts", 0)) > _RETRY_TTL_SECONDS:
+                continue  # TTL 过期丢弃（休假积压不迟到多日）
+            if item.get("id") == mid:
+                item["attempts"] = int(item.get("attempts", 1)) + 1
+                item["ts"] = now
+                item["source"] = source
+                # A方案: cron 且 attempts 超上限 → 转挂起（不占窗口）；response 豁免
+                if source != "response" and int(item.get("attempts", 1)) > _RETRY_MAX_ATTEMPTS:
+                    item["status"] = "suspended"
+                    item["suspended_since"] = item.get("suspended_since") or now
+                else:
+                    item["status"] = "active"
+                    item.pop("suspended_since", None)
+                found = True
+            out.append(item)
+        if not found:
+            # 2026-08-21: 存完整 text（原 text[:500] 截断——drain 重发时发截断版，
+            # 导致「前面一样后面少了」。补投的目的是消息必达，截断违背目的。
+            # 队列上限 _RETRY_QUEUE_MAX=100，存完整文本仍可控。）
+            out.append({"id": mid, "ts": now, "to": to, "text": text,
+                        "attempts": 1, "source": source, "status": "active"})
+        with open(_retry_path, "w") as _f:
+            for item in out:
+                _f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        # 2026-09-15: 仅当本条以 active 落盘才算「必达的推迟」；转 suspended 有 24h 转死信的风险，
+        # **不**视为必达（收紧判定，避免把可能永不送达的消息记成 ok）。
+        _entry = next((_i for _i in out if _i.get("id") == mid), None)
+        return bool(_entry) and _entry.get("status") == "active"
+    except Exception as exc:
+        logger.warning("[Weixin] retry_enqueue failed: %s", exc)
+        return False
+
+def _retry_remove(to: str, text: str) -> None:
+    """发送成功后从补投队列删除同内容条目（2026-08-20 修复）。
+
+    根因：入队幂等（_retry_enqueue 同 hash 不新增），但发送成功（慢速窗口放行）
+    后队列残留同 hash 条目 → token 恢复 drain 时**再发一次** → 同一内容重复投递
+    （实证：education 内容 806ae9eb 当晚 22:40 + 23:26 被发两次）。
+    出队去重：发送成功即清掉同 (to|text) 条目，与入队幂等互补。
+    """
+    try:
+        mid = hashlib.sha1(f"{to}|{text}".encode()).hexdigest()[:16]
+        if not Path(_retry_path).exists():
+            return
+        with open(_retry_path) as _f:
+            lines = [_l for _l in _f if _l.strip()]
+        kept = []
+        removed = 0
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except Exception:
+                kept.append(line)
+                continue
+            if item.get("id") == mid:
+                removed += 1
+            else:
+                kept.append(line)
+        if removed:
+            with open(_retry_path, "w") as _f:
+                _f.writelines(kept)
+    except Exception as exc:
+        logger.warning("[Weixin] retry_remove failed: %s", exc)
+
+def _retry_dead_letter(item: Dict[str, Any]) -> None:
+    """A方案 (2026-08-21): 挂起 24h 仍无唤醒信号 → 写死信归档（不删内容，可检索可恢复）。
+
+    写入 state/weixin_retry_dead.jsonl，保留全文、来源、attempts、原因、时间戳；
+    与补投队列分离——挂起条目归档后移出 active 队列，但仍可从死信文件恢复。
+    """
+    try:
+        dead_path = str(Path(get_hermes_home()) / "state" / "weixin_retry_dead.jsonl")
+        item["dead_since"] = time.time()
+        item["reason"] = "suspended-24h-no-wake-signal"
+        with open(dead_path, "a") as _f:
+            _f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        logger.warning(
+            "[Weixin] retry item dead-lettered (24h no wake signal, source=%s): %s (attempts=%d)",
+            item.get("source", "cron"), _safe_id(str(item.get("to", ""))), item.get("attempts", 1),
+        )
+    except Exception as exc:
+        logger.warning("[Weixin] retry_dead_letter failed: %s", exc)
+
+MSG_TYPE_USER = 1
+
 logger = logging.getLogger(__name__)
 WEIXIN_COPY_LINE_WIDTH = 120
 
@@ -59,6 +275,22 @@ SESSION_EXPIRED_ERRCODE, RATE_LIMIT_ERRCODE = -14, -2  # -2: iLink frequency lim
 # 2026-08-04 投递优化: 长消息阈值——超过则转 MD 文件发送（替代拆 chunk 撞 iLink 限流窗口）。
 # 上游 #184 实证: 同一用户 60s 窗口 >10 条被拒; 合并短块 + 长文转文件从源头减少 sendmessage 调用。
 _WEIXIN_LONG_MSG_THRESHOLD = 2000  # 字符; 杨旸拍板
+
+# 2026-09-19 发送风暴事故：正文里的**裸本地路径**会被自动当附件投递（base.extract_local_files，
+# 上游 4920c5940f/#1640 有意设计），但原实现对条数**无上限** —— 一条列出 155 条 /tmp 路径的
+# cron 产出触发了 155 次 send_document，全部失败还逐条重试，用户侧刷出一串重名「未下载」气泡。
+# 只压「正文裸路径」这一类；显式 MEDIA: 标记（Rule 16/21 通道）不受限。
+_MAX_BARE_FILE_ATTACHMENTS = 8
+
+
+def cap_bare_file_attachments(deliveries, limit=_MAX_BARE_FILE_ATTACHMENTS):
+    """给正文裸路径自动附件封顶。-> (capped_deliveries, dropped_count)，只动 label=='local file'。"""
+    media = [d for d in deliveries if d[2] != "local file"]
+    bare = [d for d in deliveries if d[2] == "local file"]
+    if len(bare) <= limit:
+        return deliveries, 0
+    return media + bare[:limit], len(bare) - limit
+
 _WEIXIN_MD_DIR = "投递"  # ~/hermes-media/投递/ — 已验证在 send-media-safe 白名单内
 MESSAGE_DEDUP_TTL_SECONDS = 300
 MEDIA_IMAGE, MEDIA_VIDEO, MEDIA_FILE, MEDIA_VOICE = 1, 2, 3, 4  # getuploadurl media_type
@@ -66,7 +298,6 @@ ITEM_TEXT, ITEM_IMAGE, ITEM_VOICE, ITEM_FILE, ITEM_VIDEO = 1, 2, 3, 4, 5  # item
 MSG_TYPE_BOT, MSG_STATE_FINISH = 2, 2
 TYPING_START, TYPING_STOP = 1, 2
 _LIVE_ADAPTERS: dict[str, Any] = {}
-
 def _is_stale_session_ret(ret: "Optional[int]", errcode: "Optional[int]", errmsg: "Optional[str]") -> bool:
     """True when iLink returns ret=-2 / errcode=-2 — iLink treats this as a
     stale-session signal (same class as errcode=-14) when errmsg is NOT a
@@ -1191,136 +1422,75 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._rate_limit_events.clear()
         self._rate_limit_circuit_until = 0.0
 
-    async def _send_text_chunk(
-        self,
-        *,
-        chat_id: str,
-        chunk: str,
-        context_token: Optional[str],
-        client_id: str,
-        source: str = "cron",
-    ) -> None:
-        """Send a single text chunk with per-chunk retry and backoff.
-
-        On session-expired errors (errcode -14), automatically retries
-        *without* ``context_token`` — iLink accepts tokenless sends as a
-        degraded fallback, which keeps cron-initiated push messages working
-        even when no user message has refreshed the session recently.
-        """
+    async def _send_text_chunk(self, *, chat_id: str, chunk: str, context_token: Optional[str], client_id: str,
+                               source: str = "cron") -> None:
+        """Send one text chunk with retry/backoff under the adapter-wide text gate. A stale-session response (``-14``,
+        or ``-2`` with ``prepare failed``/``unknown error``) is re-sent once *without* ``context_token`` — iLink accepts
+        tokenless sends as a degraded fallback, which keeps cron pushes working when no user message refreshed the
+        session. A ``-2`` that survives that fails fast via ``_session_not_ready_error``."""
         async with self._send_text_gate:
-            await self._send_text_chunk_locked(
-                chat_id=chat_id,
-                chunk=chunk,
-                context_token=context_token,
-                client_id=client_id,
-                source=source,
-            )
-
-    async def _send_text_chunk_locked(
-        self,
-        *,
-        chat_id: str,
-        chunk: str,
-        context_token: Optional[str],
-        client_id: str,
-        source: str = "cron",
-    ) -> None:
-        """Send a text chunk while holding the adapter-wide outbound text gate."""
-        last_error: Optional[Exception] = None
-        retried_without_token = False
-        for attempt in range(self._send_chunk_retries + 1):
-            if self._rate_limit_cooldown_remaining() > 0:
-                raise self._rate_limit_error()
-            try:
-                resp = await _send_message(
-                    self._send_session,
-                    base_url=self._base_url,
-                    token=self._token,
-                    to=chat_id,
-                    text=chunk,
-                    context_token=context_token,
-                    client_id=client_id,
-                )
-                # Check iLink response for session-expired error
-                if resp and isinstance(resp, dict):
-                    ret = resp.get("ret")
-                    errcode = resp.get("errcode")
-                    if (ret is not None and ret not in {0,}) or (errcode is not None and errcode not in {0,}):
-                        is_session_expired = (
-                            ret == SESSION_EXPIRED_ERRCODE
-                            or errcode == SESSION_EXPIRED_ERRCODE
-                            or _is_stale_session_ret(ret, errcode, resp.get("errmsg"))
-                        )
-                        # Session expired — strip token and retry once
-                        if is_session_expired and not retried_without_token and context_token:
-                            retried_without_token = True
-                            context_token = None
-                            self._token_store._cache.pop(
-                                self._token_store._key(self._account_id, chat_id), None
-                            )
-                            logger.warning(
-                                "[%s] session expired for %s; retrying without context_token",
-                                self.name, _safe_id(chat_id),
-                            )
+            last_error: Optional[Exception] = None
+            retried_without_token = False
+            attempt = 0  # counts real failures only — the tokenless re-send must not eat the retry budget
+            while True:
+                if self._rate_limit_cooldown_remaining() > 0:
+                    raise RuntimeError(f"iLink sendmessage rate limited; cooldown active for {self._rate_limit_cooldown_remaining():.1f}s")
+                try:
+                    resp = await _send_message(
+                        self._send_session, base_url=self._base_url, token=self._token, to=chat_id, text=chunk,
+                        context_token=context_token, client_id=client_id)
+                    ret, errcode = (resp.get("ret"), resp.get("errcode")) if resp and isinstance(resp, dict) else (None, None)
+                    if (ret is not None and ret != 0) or (errcode is not None and errcode != 0):
+                        errmsg = resp.get("errmsg") or resp.get("msg")
+                        if _is_session_expired(resp, ret, errcode) and not retried_without_token and context_token:
+                            retried_without_token, context_token = True, None
+                            self._token_store._cache.pop(self._token_store._key(self._account_id, chat_id), None)
+                            logger.warning("[%s] session expired for %s; retrying without context_token", self.name, _safe_id(chat_id))
                             continue
-                        # Rate limit (-2) — backoff and retry
-                        is_rate_limited = (
-                            ret == RATE_LIMIT_ERRCODE
-                            or errcode == RATE_LIMIT_ERRCODE
-                        )
-                        if is_rate_limited:
-                            errmsg = resp.get("errmsg") or resp.get("msg") or "rate limited"
-                            # Record the error so we raise a descriptive
-                            # RuntimeError (instead of AssertionError) if the
-                            # loop exhausts with the server still rate-limiting.
+                        if _is_stale_session_ret(ret, errcode, errmsg):
+                            # break, not raise: a raise here is caught below and re-enters the retry ladder.
+                            last_error = _session_not_ready_error(ret, errcode, errmsg)
+                            break
+                        if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
+                            raise RuntimeError(f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg or 'unknown error'}")
+                        # Keep a descriptive error for when the loop exhausts while still limited.
+                        last_error = RuntimeError(f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg or 'rate limited'}")
+                        if self._record_rate_limit_event():
                             last_error = RuntimeError(
-                                f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}"
-                            )
-                            if self._record_rate_limit_event():
-                                last_error = self._rate_limit_error()
-                                break
-                            if attempt >= self._send_chunk_retries:
-                                break
-                            wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
-                            logger.warning(
-                                "[%s] rate limited for %s; backing off %.1fs before retry",
-                                self.name, _safe_id(chat_id), wait,
-                            )
-                            await asyncio.sleep(wait)
-                            continue
-                        errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
-                        raise RuntimeError(
-                            f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
-                        )
-                self._reset_rate_limit_circuit()
-                # 出站消息时间戳记录：供引用消息时间窗口匹配
-                if chunk:
-                    _record_outbound(chunk)
-                    logger.debug("[Weixin] refmsg cache OUTBOUND: queue=%d len=%d", len(_outbound_queue), len(chunk))
-                # 2026-08-20: 发送成功即清补投队列同 hash，防 token 恢复 drain 重复发
-                _retry_remove(chat_id, chunk)
-                return
-            except Exception as exc:
-                last_error = exc
-                if attempt >= self._send_chunk_retries:
-                    break
-                wait = self._send_chunk_retry_delay_seconds * (attempt + 1)
-                logger.warning(
-                    "[%s] send chunk failed to=%s attempt=%d/%d, retrying in %.2fs: %s",
-                    self.name,
-                    _safe_id(chat_id),
-                    attempt + 1,
-                    self._send_chunk_retries + 1,
-                    wait,
-                    exc,
-                )
-                if wait > 0:
-                    await asyncio.sleep(wait)
-        assert last_error is not None
-        # 2026-08-20: 重试耗尽仍失败 → 送入补投队列（跨进程/跨重启持久化，下次 inbound drain 延迟补发）。
-        # 覆盖瞬时限流/会话过期重试无效的长窗口失败（cron 推送数小时后仍补发，消息不丢）。
-        _retry_enqueue(chat_id, chunk, source=source)
-        raise last_error
+                                f"iLink sendmessage rate limited (ret={ret} errcode={errcode} errmsg={errmsg or 'rate limited'}); "
+                                f"cooldown active for {self._rate_limit_cooldown_remaining():.1f}s")
+                            break
+                        if attempt >= self._send_chunk_retries:
+                            break
+                        attempt += 1
+                        wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
+                        logger.warning("[%s] rate limited for %s; backing off %.1fs before retry", self.name, _safe_id(chat_id), wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    self._rate_limit_events.clear()
+                    self._rate_limit_circuit_until = 0.0
+                    # 出站消息时间戳记录：供引用消息时间窗口匹配
+                    if chunk:
+                        _record_outbound(chunk)
+                        logger.debug("[Weixin] refmsg cache OUTBOUND: queue=%d len=%d", len(_outbound_queue), len(chunk))
+                    # 2026-08-20: 发送成功即清补投队列同 hash，防 token 恢复 drain 重复发
+                    _retry_remove(chat_id, chunk)
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    if attempt >= self._send_chunk_retries:
+                        break
+                    attempt += 1
+                    wait = self._send_chunk_retry_delay_seconds * attempt
+                    logger.warning("[%s] send chunk failed to=%s attempt=%d/%d, retrying in %.2fs: %s",
+                                   self.name, _safe_id(chat_id), attempt, self._send_chunk_retries + 1, wait, exc)
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+            assert last_error is not None
+            # 2026-08-20: 重试耗尽仍失败 → 送入补投队列（跨进程/跨重启持久化，下次 inbound drain 延迟补发）。
+            # 覆盖瞬时限流/会话过期重试无效的长窗口失败（cron 推送数小时后仍补发，消息不丢）。
+            _retry_enqueue(chat_id, chunk, source=source)
+            raise last_error
 
     async def _drain_retry_queue(self, wake_suspended: bool = False) -> None:
         """v3 (2026-08-21, A方案): 冲刷补投队列（fire-and-forget，不阻塞长轮询）。
@@ -1371,7 +1541,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 except Exception as exc:
                     logger.warning("[%s] retry drain failed for %s: %s",
                                    self.name, _safe_id(str(item.get("to", ""))), exc)
-                remaining.append(line)  # 失败留队
+                remaining.append(json.dumps(item, ensure_ascii=False))  # 失败留队（写回更新后的 item，持久化 status 变化）
             with open(_retry_path, "w") as _f:
                 _f.writelines(remaining)
         except Exception:
@@ -1392,6 +1562,10 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             )
         context_token = self._token_store.get(self._account_id, chat_id)
         last_message_id: Optional[str] = None
+        # 2026-09-09 (finding 4): 区分 source——对话回复=response（A方案豁免硬上限不挂起），
+        # cron 推送=metadata.source="cron"（attempts>3 转挂起）。此前 send() 未传 source 致
+        # 全部默认 cron，A方案「response 豁免」失效。
+        source = (metadata or {}).get("source", "response")
         # Extract MEDIA: tags and bare local file paths before text delivery, under the routed
         # profile's scope: Docker MEDIA translation infers the sandbox from the active profile (#109024).
         with self._media_delivery_scope(self.build_source(chat_id=chat_id)):
@@ -1399,6 +1573,14 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             local_files, final_content = self.extract_local_files(self.extract_images(cleaned_content)[1])
             deliveries = [(p, v, "media") for p, v in self.filter_media_delivery_paths(media_files)]
             deliveries += [(p, False, "local file") for p in self.filter_local_delivery_paths(local_files)]
+        deliveries, _dropped_bare = cap_bare_file_attachments(deliveries)
+        if _dropped_bare:
+            logger.warning("[%s] bare local file attachments capped: dropped %d (limit %d)",
+                           self.name, _dropped_bare, _MAX_BARE_FILE_ATTACHMENTS)
+            final_content = (final_content.rstrip()
+                             + f"\n\n⚠️ 正文中另有 {_dropped_bare} 个本地文件未随本条投递"
+                               f"（单条裸路径自动投递上限 {_MAX_BARE_FILE_ATTACHMENTS} 个；"
+                               f"如确需发送请显式写 MEDIA: 标记）")
         try:
             for path, is_voice, label in deliveries:
                 ext = Path(path).suffix.lower()
@@ -1458,11 +1640,22 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                             chunk=chunk,
                             context_token=context_token,
                             client_id=client_id,
+                            source=source,
                         )
                         last_message_id = client_id
                         if idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:
                             await asyncio.sleep(self._send_chunk_delay_seconds)
             return SendResult(success=True, message_id=last_message_id)
+        except _DeferredToRetryQueue as exc:
+            # 2026-09-15: **推迟不是失败** —— 消息已安全入补投队列，drain 会补发。
+            # 用 SendResult.deferred 向上传，cron 层据此不记 delivery_failed；
+            # 仍记 WARNING 保可观测性（"不静音"，避免队列静默失效时同时失去报警与可见错误）。
+            # ⚠️ 本分支必须在 `except Exception` **之前**，否则真失败会被吞成 deferred。
+            logger.warning(
+                "[%s] send deferred to retry queue to=%s: %s",
+                self.name, _safe_id(chat_id), exc,
+            )
+            return SendResult(success=False, error=str(exc), deferred=True)
         except Exception as exc:
             logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
             return SendResult(success=False, error=str(exc))
@@ -1566,6 +1759,9 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         upload_response = await _get_upload_url(
             self._send_session, base_url=self._base_url, token=self._token, to_user_id=chat_id, media_type=media_type, filekey=filekey,
             rawsize=rawsize, rawfilemd5=rawfilemd5, filesize=((rawsize + 16) // 16) * 16, aeskey_hex=aes_key.hex())
+        # 2026-09-14 本地定制：getUploadUrl 同样可能返回 ret/errcode 失败体（token 过期）。不校验会退化
+        # 成 "returned neither upload_param nor upload_full_url" —— 看不出根因的报错。
+        _raise_on_ilink_error(upload_response, what=f"getUploadUrl({Path(path).name})")
         upload_param = str(upload_response.get("upload_param") or "")
         ciphertext = _aes128_ecb_encrypt(plaintext, aes_key)
         # Prefer upload_full_url (direct CDN), else construct from upload_param. Both use POST — PUT 404s on the CDN.
@@ -1616,7 +1812,6 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if path.endswith(".silk") and not force_file_attachment:
             return MEDIA_VOICE, _voice_item
         return MEDIA_FILE, _file_item  # audio/* and everything else ship as file attachments
-
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         return {"name": chat_id, "type": "group" if chat_id.endswith("@chatroom") else "dm", "chat_id": chat_id}
 

@@ -1,5 +1,6 @@
 """Configurable budget constants for tool result persistence.
-Per-tool resolution: pinned > config overrides > registry > default."""
+Per-tool resolution: pinned > config overrides (verbatim, never capped) > ``mcp_``
+prefix (capped by ``default_result_size``) > registry (capped) > default."""
 
 from dataclasses import dataclass, field
 from typing import Dict
@@ -42,6 +43,44 @@ def _configured_mcp_result_size() -> int:
     return DEFAULT_MCP_RESULT_SIZE_CHARS
 
 
+def _configured_tool_overrides() -> Dict[str, int]:
+    """Read ``tool_budget.tool_overrides`` (``{tool_name: char_limit}``) via
+    ``load_config_readonly`` — same sanctioned path as
+    ``_configured_mcp_result_size()``.
+
+    Entries are consumed verbatim by ``resolve_threshold`` (priority: pinned >
+    tool_overrides > mcp prefix > registry > default), so a malformed entry must
+    never reach that chain: non-string/empty keys and values that are not positive
+    integers are skipped. Anything unreadable (missing block, non-mapping, load
+    error) returns ``{}`` — the built-in defaults — so behavior is byte-identical
+    while the key is absent.
+
+    The ``tool_budget:`` block is shared with the wider configurable-caps proposal
+    (#80508) so the two can merge without a key rename.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        data = load_config_readonly()
+        block = data.get("tool_budget") if isinstance(data, dict) else None
+        raw = block.get("tool_overrides") if isinstance(block, dict) else None
+        if not isinstance(raw, dict):
+            return {}
+        overrides: Dict[str, int] = {}
+        for tool_name, limit in raw.items():
+            if not isinstance(tool_name, str) or not tool_name:
+                continue
+            # Strict: only real ints count. ``bool`` is an int subclass and
+            # numeric strings would need silent coercion — either way the
+            # effective cap stops being auditable from the config file alone.
+            if not isinstance(limit, int) or isinstance(limit, bool):
+                continue
+            if limit > 0:
+                overrides[tool_name] = limit
+        return overrides
+    except Exception:
+        return {}
+
+
 @dataclass(frozen=True)
 class BudgetConfig:
     """Immutable budget constants: per-result threshold (``resolve_threshold``),
@@ -55,7 +94,9 @@ class BudgetConfig:
 
     def resolve_threshold(self, tool_name: str) -> int | float:
         """Priority: pinned -> tool_overrides -> mcp_ prefix -> registry per-tool -> default.
-        MCP tools get ``mcp_result_size`` (no registry entry). MCP and registry values
+        ``tool_overrides`` entries are returned **verbatim** — an operator-set cap is
+        honored as written (it may therefore exceed ``default_result_size``); MCP tools
+        get ``mcp_result_size`` (no registry entry). MCP and registry values
         are capped at ``default_result_size`` so a context-scaled budget for a small
         model still constrains tools registering a fixed 100K ``max_result_size_chars``.
 
@@ -101,14 +142,16 @@ def budget_for_context_window(context_length: int | None) -> BudgetConfig:
     oversized request (#23767).
     """
     mcp_result_size = _configured_mcp_result_size()
+    tool_overrides = _configured_tool_overrides()
     if not context_length or context_length <= 0:
-        if mcp_result_size == DEFAULT_MCP_RESULT_SIZE_CHARS:
+        if mcp_result_size == DEFAULT_MCP_RESULT_SIZE_CHARS and not tool_overrides:
             return DEFAULT_BUDGET
-        return BudgetConfig(mcp_result_size=mcp_result_size)
+        return BudgetConfig(mcp_result_size=mcp_result_size, tool_overrides=tool_overrides)
     window_chars = context_length * _CHARS_PER_TOKEN
     return BudgetConfig(
         default_result_size=max(_MIN_RESULT_SIZE_CHARS, min(int(window_chars * _PER_RESULT_WINDOW_FRACTION), DEFAULT_RESULT_SIZE_CHARS)),
         turn_budget=max(_MIN_TURN_BUDGET_CHARS, min(int(window_chars * _PER_TURN_WINDOW_FRACTION), DEFAULT_TURN_BUDGET_CHARS)),
         preview_size=DEFAULT_PREVIEW_SIZE_CHARS,
         mcp_result_size=mcp_result_size,
+        tool_overrides=tool_overrides,
     )

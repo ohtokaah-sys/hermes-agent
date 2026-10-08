@@ -619,7 +619,7 @@ _CHAT_USAGE_SHAPE = (
     (("completion_tokens",), ("output_tokens",)),
     (("prompt_tokens_details", "cached_tokens"), ("cache_read_input_tokens",), ("prompt_cache_hit_tokens",), ("cached_tokens",)),
     (("prompt_tokens_details", "cache_write_tokens"), ("prompt_tokens_details", "cache_creation_input_tokens"),
-     ("cache_creation_input_tokens",), ("cache_write_tokens",), ("prompt_cache_miss_tokens",)),
+     ("cache_creation_input_tokens",), ("cache_write_tokens",)),
 )
 
 
@@ -650,6 +650,15 @@ def normalize_usage(
     input_tokens = prompt_total if shape is _ANTHROPIC_USAGE_SHAPE else max(
         0, prompt_total - cache_read_tokens - cache_write_tokens
     )
+    # DeepSeek's native API (api.deepseek.com) reports the uncached remainder as
+    # a top-level prompt_cache_miss_tokens (the complement of
+    # prompt_cache_hit_tokens; prompt_tokens = hit + miss). It is uncached INPUT,
+    # not a cache write — parked in the cache-write bucket it was subtracted back
+    # out and collapsed input_tokens to 0 for every direct DeepSeek call. When the
+    # total is reported the subtraction above already lands on the miss bucket;
+    # take the field directly only when input collapsed to 0.
+    if not input_tokens:
+        input_tokens = _first_nonzero(u, ("prompt_cache_miss_tokens",))
 
     # Responses API: output_tokens_details.reasoning_tokens. Chat Completions
     # (OpenAI, OpenRouter, DeepSeek, ...): completion_tokens_details.reasoning_tokens.

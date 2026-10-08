@@ -995,7 +995,8 @@ class TestBackgroundReviewDeleteGate:
         finally:
             reset_current_write_origin(token)
         assert result["success"] is True
-        assert "a fact worth keeping" in store._entries_for("memory")
+        # 本地写入分流可能加 "⚠️未分类 " 前缀（CI 2607），断言用子串
+        assert any("a fact worth keeping" in e for e in store._entries_for("memory"))
 
     def test_foreground_remove_unaffected(self, store):
         store.add("memory", "entry a supervised turn may remove")

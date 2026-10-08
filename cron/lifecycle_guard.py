@@ -553,7 +553,9 @@ def lifecycle_scan_root_within_budget(text: str) -> bool:
 def _budget_exhausted(budget: _LifecycleScanBudget, what: str, depth: int) -> bool:
     logger.warning(
         "lifecycle guard scan budget exhausted (%s at depth %d); "
-        "failing closed — see _MAX_LIFECYCLE_SCAN_* in cron/lifecycle_guard.py",
+        "failing closed — this is a SCAN-LIMIT block, NOT a detected lifecycle "
+        "command (the command was not fully inspected); see _MAX_LIFECYCLE_SCAN_* "
+        "in cron/lifecycle_guard.py",
         what, depth,
     )
     budget.refusal = f"the scan budget was exhausted ({what} at depth {depth})"
@@ -1029,6 +1031,12 @@ def _read_referenced_script_unlocked(
             return None, False
         # A regular file whose size already exceeds the cap fails closed without reading it (the
         # walk budget can be far below 1 MiB).
+        # Local #13 note (2026-09-15): the earlier `.md/.log/.json`-suffix skip was removed here.
+        # Upstream's executed/mentioned view (#110422/#113944) plus `_mask_data_sink_arguments`
+        # already keep a data file that is merely mentioned (or passed to `cat`/`grep`) from
+        # failing the whole command closed, while the suffix skip ALSO let an *executed*
+        # data/unknown-suffix file escape the walk entirely. Keep the mentioned-vs-executed
+        # split, not a suffix test — an executed data file must still fail closed.
         if metadata.st_size > byte_limit:
             return None, True
         # Read the remainder (bounded); loop because os.read may return short.

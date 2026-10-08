@@ -1,7 +1,8 @@
 """Unit tests for tools/budget_config.py.
 
 Covers default values, resolve_threshold() priority chain
-(pinned > tool_overrides > registry > default), immutability,
+(pinned > tool_overrides (verbatim) > mcp_ prefix (capped) > registry (capped)
+> default), immutability,
 and the PINNED_THRESHOLDS escape-hatch for read_file.
 """
 
@@ -53,7 +54,7 @@ from tools.budget_config import (
 
 
 class TestResolveThreshold:
-    """Priority: pinned > tool_overrides > registry > default."""
+    """Priority: pinned > tool_overrides (verbatim) > mcp_ prefix (capped) > registry (capped) > default."""
 
     def test_pinned_wins_over_override(self):
         """Even if tool_overrides contains read_file, pinned value wins."""
@@ -105,13 +106,19 @@ class TestBudgetForContextWindow:
 
 
     def test_scaled_budget_constrains_oversized_result(self):
-        """A 279K-char result against a 65K model exceeds the scaled per-result
-        threshold, so it will be persisted/truncated rather than sent whole."""
+        """A 279K-char result against a 65K model is capped at the *exact* scaled value.
+
+        Asserting only ``threshold < huge_len`` stays green even if scaling silently
+        regressed to, say, 270K — so both effective caps are pinned exactly:
+        65_536 tokens x 4 chars/token x 0.15 (per-result window fraction) = 39_321,
+        which is also what the 50K ``mcp_`` value gets capped to.
+        """
         cfg = budget_for_context_window(65_536)
         huge_len = 279_549
-        threshold = cfg.resolve_threshold("mcp_firecrawl_firecrawl_search")
-        assert threshold < huge_len
-        assert cfg.default_result_size < huge_len
+        assert cfg.default_result_size == 39_321
+        assert cfg.resolve_threshold("mcp_firecrawl_firecrawl_search") == 39_321
+        assert cfg.resolve_threshold("mcp_x") == cfg.default_result_size
+        assert huge_len > cfg.default_result_size
 
 
 # ---------------------------------------------------------------------------
@@ -175,3 +182,93 @@ class TestMcpPrefixThreshold:
         cfg = budget_for_context_window(16_384)  # scaled default < 50K
         assert cfg.default_result_size < 50_000
         assert cfg.resolve_threshold("mcp_tool") == cfg.default_result_size
+
+
+# ---------------------------------------------------------------------------
+# tool_budget.tool_overrides — config-driven per-tool caps (00.4 改动 2)
+# ---------------------------------------------------------------------------
+
+
+class TestToolOverridesConfig:
+    """``tool_budget.tool_overrides`` fills resolve_threshold's 2nd priority slot.
+
+    The knob exists so a threshold can be tightened (or dialed back) without
+    editing code and restarting the gateway — the staged rollout in 00.4 改动 3
+    depends on it. With the key absent the budget must stay byte-identical.
+    """
+
+    def test_absent_key_keeps_default_singleton(self, tmp_path, monkeypatch):
+        """No config.yaml → same singleton object, i.e. zero behavior change."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert budget_for_context_window(None) is DEFAULT_BUDGET
+        assert budget_for_context_window(200_000) == BudgetConfig()
+
+    def test_override_without_context_window(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  tool_overrides:\n    terminal: 50000\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(None)
+        assert cfg.resolve_threshold("terminal") == 50_000
+        # Tools not named in the override keep the generic default.
+        assert cfg.resolve_threshold("web_search") == DEFAULT_RESULT_SIZE_CHARS
+
+    def test_override_survives_window_scaling(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  tool_overrides:\n    terminal: 50000\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(200_000)
+        assert cfg.tool_overrides == {"terminal": 50_000}
+        assert cfg.resolve_threshold("terminal") == 50_000
+
+    def test_pinned_tool_still_wins_over_override(self, tmp_path, monkeypatch):
+        """read_file stays unbounded even if a user tries to cap it."""
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  tool_overrides:\n    read_file: 1234\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(None)
+        assert cfg.resolve_threshold("read_file") == float("inf")
+
+    def test_override_wins_over_mcp_prefix_default(self, tmp_path, monkeypatch):
+        """Explicit config beats the 50K mcp_* heuristic."""
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  tool_overrides:\n    mcp_special: 75000\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(None)
+        assert cfg.resolve_threshold("mcp_special") == 75_000
+
+    def test_non_positive_non_int_entries_are_skipped(self, tmp_path, monkeypatch):
+        """Bad entries are dropped, never coerced (zero / negative / bool / str)."""
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n"
+            "  tool_overrides:\n"
+            "    good: 42000\n"
+            "    zero: 0\n"
+            "    negative: -1\n"
+            "    quoted: '50000'\n"
+            "    boolean: true\n"
+            "    nullish: null\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(None)
+        assert cfg.tool_overrides == {"good": 42_000}
+        assert cfg.resolve_threshold("quoted") == DEFAULT_RESULT_SIZE_CHARS
+
+    def test_malformed_block_falls_back_to_defaults(self, tmp_path, monkeypatch):
+        """A broken tool_overrides block must not blow up the budget lookup."""
+        bodies = (
+            "tool_budget: not-a-mapping\n",
+            "tool_budget:\n  tool_overrides: not-a-mapping\n",
+            "tool_budget:\n  tool_overrides:\n    - 1\n    - 2\n",
+        )
+        for idx, body in enumerate(bodies):
+            case_dir = tmp_path / f"case{idx}"
+            case_dir.mkdir()
+            (case_dir / "config.yaml").write_text(body)
+            monkeypatch.setenv("HERMES_HOME", str(case_dir))
+            cfg = budget_for_context_window(None)
+            assert cfg.tool_overrides == {}
+            assert cfg.resolve_threshold("terminal") == DEFAULT_RESULT_SIZE_CHARS

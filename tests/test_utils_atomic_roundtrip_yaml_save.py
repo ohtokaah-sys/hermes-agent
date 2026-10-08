@@ -288,3 +288,95 @@ class TestAtomicRoundtripYamlSave:
         atomic_roundtrip_yaml_save(config_path, {"model": {"default": "updated-model"}})
 
         assert chown_calls == [(config_path, 345, 678)]
+
+    # --- generated extra_content (the two `# ──` example blocks appended by save_config) ---
+
+    _BLOCK_A = "\n# ── Block A ───────────────────────────\n# first block body\n"
+    _BLOCK_B = "\n# ── Block B ───────────────────────────\n# second block body\n"
+
+    def test_extra_content_appended_when_absent(self, config_path):
+        from utils import atomic_roundtrip_yaml_save
+
+        atomic_roundtrip_yaml_save(
+            config_path, {"model": {"default": "m"}}, extra_content=self._BLOCK_A + self._BLOCK_B)
+
+        text = config_path.read_text(encoding="utf-8")
+        assert text.count("── Block A") == 1
+        assert text.count("── Block B") == 1
+
+    def test_extra_content_partially_missing_block_is_restored(self, config_path):
+        """A file that kept Block A but lost Block B must get B back.
+
+        Probing the concatenated blob once (only its first line) would wrongly skip the whole
+        append — the blocks have to be probed individually.
+        """
+        config_path.write_text(
+            f"# user note\n{self._BLOCK_A}model:\n  default: m\n", encoding="utf-8")
+
+        from utils import atomic_roundtrip_yaml_save
+
+        atomic_roundtrip_yaml_save(
+            config_path, {"model": {"default": "m"}}, extra_content=self._BLOCK_A + self._BLOCK_B)
+
+        text = config_path.read_text(encoding="utf-8")
+        assert text.count("── Block A") == 1, "existing block must not be duplicated"
+        assert text.count("── Block B") == 1, "missing block must be restored"
+        assert "# user note" in text
+
+    def test_extra_content_is_idempotent(self, config_path):
+        from utils import atomic_roundtrip_yaml_save
+
+        for _ in range(3):
+            atomic_roundtrip_yaml_save(
+                config_path, {"model": {"default": "m"}},
+                extra_content=self._BLOCK_A + self._BLOCK_B)
+
+        text = config_path.read_text(encoding="utf-8")
+        assert text.count("── Block A") == 1
+        assert text.count("── Block B") == 1
+
+    def test_quotes_yaml11_ambiguous_strings_in_sequences(self, config_path):
+        """List items must be quoted like scalars — ruamel resolves plain scalars under YAML 1.2,
+        so an unquoted ``off``/``yes`` comes back as a bool for every PyYAML reader here."""
+        from utils import atomic_roundtrip_yaml_save
+
+        atomic_roundtrip_yaml_save(
+            config_path,
+            {"agent": {"modes": ["off", "yes", "on", "no"], "providers": [{"provider": "on"}]}},
+        )
+
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert loaded["agent"]["modes"] == ["off", "yes", "on", "no"]
+        assert all(isinstance(m, str) for m in loaded["agent"]["modes"])
+        assert loaded["agent"]["providers"][0]["provider"] == "on"
+
+    def test_extra_content_lands_in_the_same_atomic_write(self, config_path):
+        """Whole document (YAML + generated blocks) must go through ONE atomic replace.
+
+        Appending the blocks afterwards would split the save into two writes and expose a torn or
+        partial file to a crash landing between them.
+        """
+        config_path.write_text("model:\n  default: m\n", encoding="utf-8")
+
+        import utils
+        from utils import atomic_roundtrip_yaml_save
+
+        calls = []
+        real_atomic_write = utils._atomic_write
+
+        def _spy(path, write_fn, **kwargs):
+            calls.append((Path(path), write_fn))
+            return real_atomic_write(path, write_fn, **kwargs)
+
+        with patch("utils._atomic_write", side_effect=_spy):
+            atomic_roundtrip_yaml_save(
+                config_path, {"model": {"default": "m2"}}, extra_content=self._BLOCK_A)
+
+        assert len(calls) == 1, f"expected a single atomic write, got {len(calls)}"
+
+        import io
+        buf = io.StringIO()
+        calls[0][1](buf)  # the captured temp-file writer
+        written = buf.getvalue()
+        assert "── Block A" in written, "generated block must be part of the same write"
+        assert "m2" in written

@@ -450,6 +450,12 @@ def _roundtrip_load(path: Path):
 
 
 def _roundtrip_dump(path: Path, yaml_rt, config, *, extra_content: str | None = None) -> None:
+    """Atomic single-write replace.
+
+    *extra_content* (generated comment blocks) is written INSIDE the same temp file so the whole
+    document lands in one rename. Appending it afterwards would split the save into two writes and
+    expose a torn or partial document to a crash between them.
+    """
     def _write(f) -> None:
         yaml_rt.dump(config, f)
         if extra_content:
@@ -512,7 +518,6 @@ def _rt_value(value: Any) -> Any:
     """Plain Python value → ruamel node: YAML 1.1-ambiguous strings force-quoted at every depth
     (a bare ``off`` inside a list reads back as ``False`` just like one at the top level)."""
     from ruamel.yaml.comments import CommentedMap, CommentedSeq
-    from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 
     if isinstance(value, dict):
         node = CommentedMap()
@@ -521,13 +526,58 @@ def _rt_value(value: Any) -> Any:
         return node
     if isinstance(value, (list, tuple)):
         return CommentedSeq(_rt_value(v) for v in value)
-    if isinstance(value, str) and value.lower() in _YAML11_AMBIGUOUS_WORDS:
-        return DoubleQuotedScalarString(value)
+    # Leaves share the YAML 1.1 quote rule with the local _quote_yaml11_ambiguous helper.
+    return _quote_yaml11_ambiguous(value)
+
+
+def _quote_yaml11_ambiguous(value: Any) -> Any:
+    """Recursively double-quote strings a YAML 1.1 reader would re-type.
+
+    ruamel dumps plain scalars under YAML 1.2, where far fewer words are reserved than under the
+    YAML 1.1 that PyYAML/``yaml.safe_load`` (and every other config reader here) applies — so
+    ``mode: off`` would round-trip back as ``False``. Applied to sequences and nested maps as well,
+    not just scalars: a list item is just as readable, and the PyYAML writer this replaced quoted
+    in both cases.
+    """
+    from ruamel.yaml.scalarstring import DoubleQuotedScalarString
+
+    if isinstance(value, str):
+        return DoubleQuotedScalarString(value) if value.lower() in _YAML11_AMBIGUOUS_WORDS else value
+    if isinstance(value, list):
+        return [_quote_yaml11_ambiguous(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _quote_yaml11_ambiguous(v) for k, v in value.items()}
     return value
 
 
+def _pending_generated_blocks(path: Path, extra_content: str | None) -> str | None:
+    """The subset of *extra_content* whose blocks the file does not already carry.
+
+    Probed **per block** (each generated block starts with a ``# ──`` banner, which is also the
+    split delimiter), not once for the whole blob: a file that kept the Security block but lost the
+    Fallback block must still get the missing one back. Returns None when nothing is missing.
+    """
+    if not extra_content:
+        return None
+    try:
+        have = {ln.strip() for ln in path.read_text(encoding="utf-8").splitlines()}
+    except OSError:
+        have = set()
+    missing = []
+    for block in extra_content.split("\n# ──"):
+        if not block.strip():
+            continue
+        body = "\n# ──" + block
+        probe = next((ln.strip() for ln in body.splitlines() if ln.strip()), "")
+        if probe and probe not in have:
+            missing.append(body)
+    return "".join(missing) or None
+
+
 def atomic_roundtrip_yaml_save(path: str | Path, new_state: dict, *,
+                               extra_content: str | None = None,
                                extra_content_on_create: str | None = None) -> None:
+    # 本地定制：extra_content 为旧调用方保留（按块去重补写）；extra_content_on_create 仅新建文件时追加。
     """Persist a full config-state dict while preserving comments and ordering.
 
     THE on-disk primitive for ``config.yaml`` (production callers reach it through
@@ -550,6 +600,7 @@ def atomic_roundtrip_yaml_save(path: str | Path, new_state: dict, *,
     require_readable_config_before_write(path)
     creating = not path.exists() or not path.read_text(encoding="utf-8").strip()
     yaml_rt, existing = _roundtrip_load(path)
+    pending = _pending_generated_blocks(path, extra_content)
 
     def _unchanged(current: Any, value: Any) -> bool:
         # ``True == 1`` in Python; a bool↔int flip is a real change for YAML readers.
@@ -575,16 +626,27 @@ def atomic_roundtrip_yaml_save(path: str | Path, new_state: dict, *,
         # else: unchanged — keep the existing node and the comments/quoting attached to it
 
     def _merge(dst: CommentedMap, src: dict) -> None:
+        # ── 2026-09-17 治根：序列【原地】更新，保住项级注释 ──
+        # Dispatch through _merge_item so an existing CommentedMap / CommentedSeq / unchanged
+        # scalar is updated IN PLACE. Reassigning the whole node (`dst[key] = ...`) throws away
+        # the comments and quotes ruamel hangs off it — rebuilding a list loses every
+        # item-level comment (the C3 fixture: `- write_file_hook   # 注释`). _merge_item
+        # recurses into CommentedMap/CommentedSeq and leaves an unchanged scalar untouched;
+        # only genuinely new or changed leaves are rebuilt, and _rt_value force-quotes YAML
+        # 1.1-ambiguous strings at every depth.
         for key, value in src.items():
             if key in dst:
                 _merge_item(dst, key, value)
             else:
                 dst[key] = _rt_value(value)
+        # Keys missing from src are deleted: ``cfg.pop("custom_prompt")`` then save must remove
+        # the key from disk ("explicit absence" semantics of the old _save_cfg pattern).
         for key in [k for k in dst if k not in src]:
             del dst[key]
 
     _merge(existing, new_state)
-    _roundtrip_dump(path, yaml_rt, existing, extra_content=extra_content_on_create if creating else None)
+    _roundtrip_dump(path, yaml_rt, existing,
+                    extra_content=pending or (extra_content_on_create if creating else None))
 
 
 def safe_json_loads(text: str, default: Any = None) -> Any:

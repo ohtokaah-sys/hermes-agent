@@ -352,7 +352,62 @@ class TestEnforceTurnBudget:
         assert sum(PERSISTED_OUTPUT_TAG in m["content"][0]["text"] for m in msgs) >= 2
         assert all(m["content"][1]["text"] == "scale note" and m["content"][2] == img for m in msgs)
 
-# ── Per-tool threshold integration ────────────────────────────────────
+    # -- Shrink gate + non-str guard (2026-09-15) -------------------------------
+    # Regression cover for two MEASURED defects:
+    #  (a) the persisted block is a FIXED ~2.4K chars, so swapping it in for anything
+    #      smaller GROWS the turn's context (50 x 1.6K went 80K -> 118K, +47% over a
+    #      78,643 budget) — the opposite of this layer's purpose;
+    #  (b) non-str (multimodal) content reached the persist path and raised
+    #      TypeError: can only concatenate str (not "list") to str.
+
+    def test_small_results_are_not_swapped_in(self):
+        """Every candidate is smaller than the replacement block => nothing is swapped."""
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        msgs = [{"role": "tool", "tool_call_id": f"t{i}", "name": "web_search",
+                 "content": "x" * 1_600} for i in range(8)]
+        before = sum(len(m["content"]) for m in msgs)
+        enforce_turn_budget(msgs, env=env, config=BudgetConfig(turn_budget=1_000))
+        assert not any(PERSISTED_OUTPUT_TAG in m["content"] for m in msgs)
+        assert sum(len(m["content"]) for m in msgs) == before
+
+    def test_aggregate_never_grows(self):
+        """Contract: the aggregate after enforcement is never LARGER than before it."""
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        for n, size, budget in ((50, 1_600, 78_643), (6, 42_000, 200_000), (3, 5_000, 12_000)):
+            msgs = [{"role": "tool", "tool_call_id": f"t{i}", "name": "terminal",
+                     "content": "x" * size} for i in range(n)]
+            before = sum(len(m["content"]) for m in msgs)
+            enforce_turn_budget(msgs, env=env, config=BudgetConfig(turn_budget=budget))
+            after = sum(len(m["content"]) for m in msgs)
+            assert after <= before, f"n={n} size={size} budget={budget}: {before} -> {after}"
+
+    def test_non_string_content_is_skipped(self):
+        """A multimodal (list) result must not crash and must be left untouched."""
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        parts = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
+        msgs: list[dict] = [{"role": "tool", "tool_call_id": f"t{i}", "name": "terminal",
+                             "content": "x" * 40_000} for i in range(5)]
+        msgs.append({"role": "tool", "tool_call_id": "tm", "name": "read_file",
+                     "content": parts})
+        enforce_turn_budget(msgs, env=env, config=BudgetConfig(turn_budget=16_000))
+        assert msgs[-1]["content"] is parts
+
+    def test_log_line_names_the_real_tool(self, caplog):
+        """Layer 3 logged only '__budget_enforcement__'; attribution needs the real tool."""
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        msgs = [{"role": "tool", "tool_call_id": f"t{i}", "name": "web_extract",
+                 "content": "x" * 90_000} for i in range(4)]
+        with caplog.at_level("INFO"):
+            enforce_turn_budget(msgs, env=env, config=BudgetConfig(turn_budget=100_000))
+        assert "Budget enforcement: persisted tool result" in caplog.text
+        assert "web_extract" in caplog.text
+
+
+# ── Per-tool threshold integration ────────────────────────────────
 
 class TestPerToolThresholds:
     """Verify registry wiring for per-tool thresholds."""

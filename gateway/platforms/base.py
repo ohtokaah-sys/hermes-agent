@@ -1713,6 +1713,13 @@ class SendResult:
     # SEND_ERROR_KINDS member (failures only) via :func:`classify_send_error`, so consumers
     # branch without substring-matching ``error``.
     error_kind: Optional[str] = None
+    # 2026-09-15: the message was NOT delivered on this attempt, but it is safely held in a
+    # durable retry queue that a later drain will flush (weixin 补投队列). That is a DEFERRAL,
+    # not a failure — cron must not record ``delivery_failed`` for a message the drain will
+    # still send (same principle as ``cron.delivery_queue._terminalize_wait_timeout``).
+    # ``success`` stays False (nothing was sent yet); consumers that only care about
+    # "lost vs not-lost" check this flag.
+    deferred: bool = False
 
 
 # Longest server ``retry_after`` ``_send_with_retry`` will sleep inline. Longer penalties return the

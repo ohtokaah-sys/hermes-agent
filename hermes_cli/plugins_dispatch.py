@@ -57,6 +57,33 @@ _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 _HOOK_MAX_ABANDONED_WORKERS = 3
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
 
+# Value-returning transforms whose return value IS the safety decision: an unscreened value must
+# never silently reach the model, and the skip happens *before* the callback runs, so no plugin
+# can compensate. Two rules for these hooks:
+#   1) a callback that is merely *running* gets its own worker instead of being skipped — the
+#      per-callback in-flight guard exists to bound hung callbacks, not busy ones;
+#   2) any remaining skip (timeout / the suppression window that follows it / worker-start
+#      failure) substitutes the message below for the pipeline value, so a missing transform
+#      fails closed. The timeout + suppression window still bound a hung callback, so allowing
+#      concurrency here cannot spawn unbounded workers.
+# Extending this map to another hook is a deliberate decision: check that its consumers treat the
+# replacement string as "withheld content" first.
+#
+# Deliberately NOT extended to the other value-returning transforms (transform_llm_output,
+# transform_terminal_output): a dropped transform there is a *functional* loss (a missing MEDIA tag
+# or reminder), not an unscreened value reaching the model — and substituting a withheld-content
+# string for a model reply would be worse than the drop. Measured 2026-09-22: both profiles logged
+# ZERO busy skips/timeouts on those two hooks (tool_result: 3 in default, 15 in the second profile),
+# so enabling concurrency there would trade 0 observed drops for unaudited races across ~4 live
+# callbacks. Revisit only with evidence (a logged skip) plus a per-callback thread-safety review.
+_TRANSFORM_TOOL_RESULT_TIMEOUT_BLOCK_MESSAGE = (
+    "[hermes] transform_tool_result plugin callback timed out or is still running — "
+    "the tool result was withheld (fail-closed). Retry, or tell the user."
+)
+_HOOK_FAIL_CLOSED_TRANSFORMS: Dict[str, str] = {
+    "transform_tool_result": _TRANSFORM_TOOL_RESULT_TIMEOUT_BLOCK_MESSAGE,
+}
+
 
 def _policy_error_block_directive(hook_name: str, cb: Callable, exc: BaseException) -> dict[str, str]:
     """Block directive for a fail-closed hook whose callback raised: names the callback and the
@@ -214,7 +241,8 @@ class PluginDispatchMixin:
         Payloads evolve additively: ``**kwargs`` callbacks get everything, narrow signatures only
         what they declare. Each callback is isolated. Bounded hooks and ``pre_tool_call`` run under
         ``plugins.hook_callback_timeout`` (worker abandoned, never joined); ``pre_tool_call`` fails
-        closed with a block directive, others skip. ``_HOOK_CALLER_THREAD_HOOKS`` always run on the
+        closed with a block directive, others skip — except a ``_HOOK_FAIL_CLOSED_TRANSFORMS``
+        hook, whose withheld-content message replaces the value instead of silently passing it. ``_HOOK_CALLER_THREAD_HOOKS`` always run on the
         caller thread. ``pre_llm_call`` may return ``{"context": "..."}`` (or a str) to inject.
         """
         from hermes_cli.plugins import _resolve_hook_callback_timeout
@@ -233,6 +261,10 @@ class PluginDispatchMixin:
                     if ret is _HOOK_SKIPPED:
                         if fail_closed:  # policy hook: fail closed with a block directive
                             results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
+                        elif hook_name in _HOOK_FAIL_CLOSED_TRANSFORMS:
+                            # Withholding must outrank a sibling transform: the consumer takes the
+                            # first string, so the fail-closed value goes to the front.
+                            results.insert(0, _HOOK_FAIL_CLOSED_TRANSFORMS[hook_name])
                         continue
                 else:
                     ret = self._invoke_hook_callback(cb, kwargs)
@@ -281,9 +313,16 @@ class PluginDispatchMixin:
         suppression_key = (hook_name, id(cb))
         gate_key = (*suppression_key, _hook_call_identity(kwargs))
         token = object()
+        # A fail-closed transform's return value IS the safety decision, and the busy-skip fires
+        # before the callback runs — so skipping a merely-running callback would send an unscreened
+        # tool result to the model with no plugin able to compensate. Such a hook gets its own
+        # worker for concurrent calls: upstream's call-identity gate already separates calls that
+        # carry a tool_call_id; this covers the identity-less case too. Only a timeout and the
+        # suppression window that follows it still bound a hung callback (fail-closed stays).
+        concurrent_ok = hook_name in _HOOK_FAIL_CLOSED_TRANSFORMS
         with self._hook_timeout_lock:
             suppressed_until = self._hook_timeout_suppressed_until.get(suppression_key)
-            if (gate_key in self._hook_running_callbacks
+            if ((gate_key in self._hook_running_callbacks and not concurrent_ok)
                     or (suppressed_until is not None and suppressed_until > time.monotonic())):
                 logger.warning(
                     "Hook '%s' callback %s skipped after previous "
@@ -311,7 +350,7 @@ class PluginDispatchMixin:
         outcome: dict[str, Any] = {}
         failure: dict[str, BaseException] = {}
 
-        def _release_token() -> None:
+        def _release_inflight() -> None:
             with self._hook_timeout_lock:
                 if self._hook_running_callbacks.get(gate_key) is token:
                     self._hook_running_callbacks.pop(gate_key, None)
@@ -327,14 +366,14 @@ class PluginDispatchMixin:
             except BaseException as exc:
                 failure["exc"] = exc
             finally:
-                _release_token()
+                _release_inflight()
                 done.set()
 
         thread = threading.Thread(target=_runner, name=f"hermes-hook-{callback_name}"[:40], daemon=True)
         try:
             thread.start()
         except RuntimeError as exc:
-            _release_token()  # the runner's finally never runs when OS thread creation fails
+            _release_inflight()  # the runner's finally never runs when OS thread creation fails
             logger.warning(
                 "Hook '%s' callback %s worker failed to start: %s — skipping",
                 hook_name, callback_name, exc)

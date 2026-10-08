@@ -2807,9 +2807,13 @@ def claim_job_for_fire(
 def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
     """Refresh an active ``fire_claim`` without extending another owner's lease: an execution may
     outlive the TTL, and the owner check stops a stale runner from refreshing a recovered claim.
-    Deliberately NOT under ``_under_fire_fence``: the run thread holds the per-job fence across
-    delivery, and the fence's reentrancy is per thread, so the heartbeat thread would time out and
-    report a false ownership loss. ``_jobs_lock`` already serializes the compare-and-refresh."""
+
+    Deliberately does NOT take the per-job fire fence. A live run holds that fence across its
+    delivery, which can run for minutes on a rate-limited channel — a renewal that awaited it
+    would block, fail closed, and be misread as ownership loss, interrupting a healthy run. The
+    reverse bites too: a heartbeat blocked while holding the fence can time out the run's own
+    delivery fence and silently drop a delivery. The owner CAS under the global jobs lock is the
+    only synchronization needed — same shape as ``heartbeat_run_claim``. Do not re-add the fence."""
     def apply(jobs, _i, job):
         return _refresh_claim(jobs, job.get("fire_claim"), expected_owner)
 

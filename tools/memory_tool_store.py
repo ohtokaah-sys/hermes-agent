@@ -276,38 +276,51 @@ class MemoryStore:
         if summary_path.exists():
             import time
             age_seconds = time.time() - summary_path.stat().st_mtime
-            if age_seconds < 86400:
-                summary_text = summary_path.read_text(encoding="utf-8")
-                summary_text = self._apply_memory_constraint_guard(summary_text)
-                header = f"MEMORY (daily summary) [{len(summary_text):,} chars, {age_seconds/3600:.1f}h ago]"
-                _src_hint = _memory_source_stats_hint()
-                if _src_hint:
-                    header += " | " + _src_hint
-                separator = "═" * 46
-                self._system_prompt_snapshot["memory"] = f"{separator}\n{header}\n{separator}\n{summary_text}"
-                self._summary_snapshot_mtime = summary_path.stat().st_mtime
-                from tools.memory_tool import _cost_record
-                _cost_record(self._cost_sid, "lean_chars", len(summary_text))
+            # 2026-09-21 fix（同类同修）：原为 `if age_seconds < 86400`，超龄时**静默**
+            # 注入全量 MEMORY.md（连告警都没有）。改为无条件注入摘要；超 24h 记告警
+            # （每日 03:00 的 memory_summarize.py 本该让它保持新鲜）。
+            if age_seconds >= 86400:
+                logger.warning(
+                    "MEMORY_SUMMARY.md is %.1fh old — injecting the summary; no full-memory "
+                    "fallback (daily 03:00 cron should have refreshed it)", age_seconds / 3600,
+                )
+            summary_text = summary_path.read_text(encoding="utf-8")
+            summary_text = self._apply_memory_constraint_guard(summary_text)
+            header = f"MEMORY (daily summary) [{len(summary_text):,} chars, {age_seconds/3600:.1f}h ago]"
+            _wm = self._memory_watermark()
+            if _wm:
+                header += " | " + _wm
+            _src_hint = _memory_source_stats_hint()
+            if _src_hint:
+                header += " | " + _src_hint
+            separator = "═" * 46
+            self._system_prompt_snapshot["memory"] = f"{separator}\n{header}\n{separator}\n{summary_text}"
+            self._summary_snapshot_mtime = summary_path.stat().st_mtime
+            from tools.memory_tool import _cost_record
+            _cost_record(self._cost_sid, "lean_chars", len(summary_text))
 
         # USER_SUMMARY.md 优先注入（与 MEMORY 摘要重定向对称设计，Phase 2 USER 渐进式披露）
         user_summary_path = mem_dir / "USER_SUMMARY.md"
         if user_summary_path.exists():
             import time
             age_seconds = time.time() - user_summary_path.stat().st_mtime
-            if age_seconds < 86400:
-                summary_text = user_summary_path.read_text(encoding="utf-8")
-                summary_text = self._apply_user_constraint_guard(summary_text)
-                header = f"USER PROFILE (summary) [{len(summary_text):,} chars, {age_seconds/3600:.1f}h ago]"
-                separator = "═" * 46
-                self._system_prompt_snapshot["user"] = f"{separator}\n{header}\n{separator}\n{summary_text}"
-                self._user_summary_snapshot_mtime = user_summary_path.stat().st_mtime
-                from tools.memory_tool import _cost_record
-                _cost_record(self._cost_sid, "user_chars", len(summary_text))
-            else:
+            # 2026-09-21 fix（B，同类同修）：原为 `if age_seconds < 86400` 才注入摘要，
+            # 否则回退全量 USER.md。年龄不代表内容过期——USER.md 未变则摘要即最新版，
+            # 且 _refresh_user_summary 已按 mtime 决定要不要重建。
+            # 改为无条件注入；超 24h 仅记告警，供监控发现「该刷新时没刷新」。
+            if age_seconds >= 86400:
                 logger.warning(
-                    "USER_SUMMARY.md is stale (%.1fh old), falling back to full USER.md",
-                    age_seconds / 3600,
+                    "USER_SUMMARY.md is %.1fh old but USER.md is not newer — injecting the "
+                    "summary; no full-profile fallback", age_seconds / 3600,
                 )
+            summary_text = user_summary_path.read_text(encoding="utf-8")
+            summary_text = self._apply_user_constraint_guard(summary_text)
+            header = f"USER PROFILE (summary) [{len(summary_text):,} chars, {age_seconds/3600:.1f}h ago]"
+            separator = "═" * 46
+            self._system_prompt_snapshot["user"] = f"{separator}\n{header}\n{separator}\n{summary_text}"
+            self._user_summary_snapshot_mtime = user_summary_path.stat().st_mtime
+            from tools.memory_tool import _cost_record
+            _cost_record(self._cost_sid, "user_chars", len(summary_text))
 
     @staticmethod
     @contextmanager
@@ -375,6 +388,38 @@ class MemoryStore:
     def _usage_pct(self, target: str, current: int) -> str:
         limit = self._char_limit(target)
         return f"{min(100, int((current / limit) * 100)) if limit > 0 else 0}% — {current:,}/{limit:,} chars"
+
+    def _memory_watermark(self) -> str:
+        """CI 2.1-A（2026-09-15）：把 MEMORY 的预算水位显式写进注入头。
+
+        理由：限额与每周整理都已存在，但模型在会话里看不到水位——只能等一次写入被拒
+        （事后）或等 Auto-Dream 周日跑（系统被动）。此处只做**只读展示**，不改任何行为。
+        口径用 _char_count（= 限额真正执法的那个数），非文件字节数。
+        """
+        try:
+            cur = self._char_count("memory")
+            if cur <= 0:
+                # CI 3.2 #10 复核修复：_char_count 读的是**内存态** entries，而本函数在
+                # 「构建系统提示」时被调用——那一刻条目往往还没载入 ⇒ 计数恒为 0 ⇒
+                # 水位永远不渲染（线上 454 条含 daily summary 的提示里「文件水位」0 命中）。
+                # 回退到磁盘，但**口径与限额执法完全同一套**：parse + ENTRY_DELIMITER.join。
+                try:
+                    raw = self._path_for("memory").read_text(encoding="utf-8")
+                except OSError:
+                    return ""
+                # 2026-09-21 fix: 冷态必须与 load_from_disk 的去重口径对齐（那边是
+                # list(dict.fromkeys(_read_file(...)))）。文件里残留的连续 "§" 行会被
+                # 解析成若干内容为 "§" 的条目，不去重则冷态多算、热态少算（实测 Δ=20），
+                # 水位随「是否已载入」漂移 → CI 2.1 夹具 W5 变红（2026-09-21 注册表巡检）。
+                cur = len(ENTRY_DELIMITER.join(dict.fromkeys(self._parse_entries(raw))))
+            limit = self._char_limit("memory")
+            if cur <= 0 or limit <= 0:
+                return ""
+            pct = min(100, int(cur / limit * 100))
+            flag = " ⚠️ 接近上限" if pct >= 85 else ""
+            return f"文件水位 {cur:,}/{limit:,} = {pct}%{flag}"
+        except Exception:  # 展示层永不阻断注入
+            return ""
 
     def _failure_with_entries(self, target: str, message: str) -> dict[str, Any]:
         """Over-budget consolidation failure carrying the live entries so the model can consolidate."""
@@ -733,8 +778,13 @@ class MemoryStore:
             return  # No change since last load
 
         age_seconds = time.time() - summary_mtime
+        # 2026-09-21 fix（同类同修）：原为 `return` ⇒ 超 24h 回退注入全量 MEMORY.md。
+        # 与 USER 侧同一模式，一并改为照常注入 + 记告警（每日 03:00 cron 本该保鲜）。
         if age_seconds >= 86400:
-            return  # Stale summary
+            logger.warning(
+                "MEMORY_SUMMARY.md is %.1fh old — injecting the summary; no full-memory "
+                "fallback (daily 03:00 cron should have refreshed it)", age_seconds / 3600,
+            )
 
         summary_text = summary_path.read_text(encoding="utf-8")
         # READ-time constraint guard: independent YAML mtime tracking.
@@ -750,6 +800,9 @@ class MemoryStore:
                 self._memory_guard_mtime = constraint_mtime
 
         header = f"MEMORY (daily summary) [{len(summary_text):,} chars, {age_seconds/3600:.1f}h ago]"
+        _wm = self._memory_watermark()
+        if _wm:
+            header += " | " + _wm
         separator = "═" * 46
         self._system_prompt_snapshot["memory"] = (
             f"{separator}\n{header}\n{separator}\n{summary_text}"
@@ -796,7 +849,15 @@ class MemoryStore:
 
         age_seconds = time.time() - user_summary_mtime
         if age_seconds >= 86400:
-            return  # Stale summary — fall back to full USER.md
+            # 2026-09-21 fix（B）：旧行为是直接 return ⇒ 回退注入**全量 USER.md**。
+            # 但摘要的内容新鲜度由上方「USER.md mtime > 摘要 mtime」比较决定——USER.md
+            # 长期不变时摘要就是最新版，年龄本身不代表过期。硬回退实测让 35,346 字符
+            # 全量画像顶替 4,216 字符摘要（连续 37h、单日 8 次告警）。改为照常注入 +
+            # 留一条告警，供监控发现「该刷新时没刷新」。
+            logger.warning(
+                "USER_SUMMARY.md is %.1fh old but USER.md is not newer — injecting the "
+                "summary; no full-profile fallback", age_seconds / 3600,
+            )
 
         summary_text = user_summary_path.read_text(encoding="utf-8")
         # READ-time 约束守护：每次加载摘要时检查 YAML 约束覆盖，追加未覆盖条目
@@ -993,7 +1054,8 @@ class MemoryStore:
                     "Authorization": f"Bearer {ds_key}",
                 },
             )
-            resp = _json.loads(_urllib.urlopen(req, timeout=60).read())
+            # 2026-09-21 fix（C，同类同修）：与 USER 摘要生成同款超时问题，一并放宽到 600s。
+            resp = _json.loads(_urllib.urlopen(req, timeout=600).read())
             summary = resp["choices"][0]["message"]["content"].strip()
             # Strip markdown code block wrappers（对称 USER 摘要生成行 691-695）
             if summary.startswith("```"):
@@ -1130,7 +1192,9 @@ class MemoryStore:
                     "Authorization": f"Bearer {ds_key}",
                 },
             )
-            resp = _json.loads(_urllib.urlopen(req, timeout=60).read())
+            # 2026-09-21 fix（C）：实测单次重建 125.7s（35K 字符输入），原 timeout=60
+            # 靠「数据持续流动」侥幸不超时。放宽到 600s；**不限制 max_tokens**（保持 384000）。
+            resp = _json.loads(_urllib.urlopen(req, timeout=600).read())
             summary = resp["choices"][0]["message"]["content"].strip()
         except Exception:
             logger.warning(

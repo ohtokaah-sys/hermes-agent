@@ -205,12 +205,18 @@ class _SherpaKwsEngine(_Engine):
         self._display_to_profile: dict[str, str] = {}
         kw = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", prefix="hermes-kws-", delete=False,
                                          encoding="utf-8")
-        for p, toks in zip(phrases, tokens):
-            display = p.upper().replace(" ", "_")
-            self._display_to_profile[display] = phrase_map[p]
-            kw.write(" ".join(toks) + f" @{display}\n")
+        self._keywords_file = kw.name  # capture early so a write failure still leaves a trackable path
+        try:
+            for p, toks in zip(phrases, tokens):
+                display = p.upper().replace(" ", "_")
+                self._display_to_profile[display] = phrase_map[p]
+                kw.write(" ".join(toks) + f" @{display}\n")
+        except Exception:
+            kw.close()
+            with suppress(OSError):
+                os.unlink(self._keywords_file)
+            raise
         kw.close()
-        self._keywords_file = kw.name
 
         # Shared 0..1 sensitivity → sherpa keywords_threshold. 0.5 lands on sherpa's
         # recommended 0.25; a stricter 0.35 missed ~12% of true positives in live TTS

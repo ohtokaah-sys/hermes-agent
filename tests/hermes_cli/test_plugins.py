@@ -1356,6 +1356,7 @@ class TestForceReloadSymmetry:
     def test_concurrent_same_tool_calls_with_distinct_ids_both_run(self, monkeypatch):
         """Two concurrent calls of one tool are different work, not a duplicate (#98382)."""
         import time
+
         monkeypatch.setattr(
             "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 5.0
         )
@@ -1525,6 +1526,81 @@ class TestForceReloadSymmetry:
         mgr.invoke_hook("post_tool_call", tool_name="read_file", tool_call_id="call-b")
 
         assert len(starts) == 2
+
+    def test_transform_tool_result_not_skipped_while_callback_is_busy(self, monkeypatch):
+        """A merely-running transform callback must not drop the transform (fail-open).
+
+        Regression: the per-callback in-flight guard returned _HOOK_SKIPPED for a *busy*
+        callback, so concurrent tool results (read_file / web_extract batches) reached the
+        model unscreened — the skip happens before the callback runs, so no plugin can
+        compensate. A transform whose return value IS the safety decision now gets its own
+        worker; only hung callbacks stay bounded by the timeout + suppression window.
+        """
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 5.0
+        )
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def screening(**kwargs):
+            if kwargs.get("result") == "raw-1":
+                entered.set()
+                release.wait(timeout=5.0)
+            return "SCREENED(%s)" % kwargs.get("result")
+
+        mgr = PluginManager()
+        mgr._hooks["transform_tool_result"] = [screening]
+
+        first = {}
+
+        def _first_call():
+            first["out"] = mgr.invoke_hook(
+                "transform_tool_result", tool_name="read_file", args={}, result="raw-1"
+            )
+
+        t = threading.Thread(target=_first_call)
+        t.start()
+        assert entered.wait(timeout=2.0), "first callback never entered"
+
+        second = mgr.invoke_hook(
+            "transform_tool_result", tool_name="read_file", args={}, result="raw-2"
+        )
+        release.set()
+        t.join(timeout=5.0)
+
+        assert first["out"] == ["SCREENED(raw-1)"]
+        assert second == ["SCREENED(raw-2)"], (
+            "concurrent transform was skipped instead of screened: %r" % (second,)
+        )
+
+    def test_transform_tool_result_fails_closed_when_callback_unavailable(self, monkeypatch):
+        """Timed-out / suppressed transform must withhold content, not pass it through."""
+        from hermes_cli.plugins_dispatch import (
+            _TRANSFORM_TOOL_RESULT_TIMEOUT_BLOCK_MESSAGE as WITHHELD,
+        )
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        hold = threading.Event()
+
+        def hung(**_kwargs):
+            hold.wait(timeout=10.0)
+            return "SCREENED"
+
+        mgr = PluginManager()
+        mgr._hooks["transform_tool_result"] = [hung]
+
+        assert mgr.invoke_hook(
+            "transform_tool_result", tool_name="read_file", args={}, result="raw"
+        ) == [WITHHELD]
+        # The suppression window that follows a timeout must stay fail-closed as well.
+        assert mgr.invoke_hook(
+            "transform_tool_result", tool_name="read_file", args={}, result="raw"
+        ) == [WITHHELD]
+        hold.set()
 
     def test_pre_tool_call_timeout_fail_closed(self, monkeypatch):
         """Timed-out pre_tool_call must return a block directive, not allow."""

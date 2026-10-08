@@ -266,10 +266,11 @@ def _write_wav_bytes_as(wav_bytes: bytes, output_path: str) -> str:
         with open(output_path, "wb") as f:
             f.write(wav_bytes)
         return output_path
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp.write(wav_bytes)
-        wav_path = tmp.name
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    wav_path = tmp.name
     try:
+        tmp.write(wav_bytes)
+        tmp.close()
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
             opus = _OPUS_VOICE_ARGS if output_path.lower().endswith(".ogg") else []

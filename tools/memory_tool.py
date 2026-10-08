@@ -560,7 +560,8 @@ registry.register(
     toolset="memory",
     schema=MEMORY_SCHEMA,
     handler=lambda args, **kw: memory_tool(
-        action=args.get("action", ""), target=args.get("target"), store=kw.get("store"),
+        action=args.get("action", ""), target=args.get("target", "memory"), store=kw.get("store"),
+        query=args.get("query"),
         **{k: args.get(k) for k in ("content", "old_text", "new_text", "operations")}),
     check_fn=check_memory_requirements,
     emoji="🧠",
@@ -942,28 +943,6 @@ def _load_meta_file(meta_path):
         return None
 
 
-def _memory_source_stats_hint() -> str:
-    """2026-08-11 CI 白鳝方法论2: 统计 memory_meta.json 中 source 分布，返回注入提示。
-
-    纯知情不改行为：让 Agent/用户看到摘要时知道哪些条目是 AI 推断。
-    失败降级返回空串（不阻塞注入）。
-    """
-    try:
-        import json as _json
-        meta_path = get_hermes_home() / "state" / "memory_meta.json"
-        if not meta_path.exists():
-            return ""
-        with open(meta_path, encoding="utf-8") as _f:
-            meta = _json.load(_f)
-        entries = meta.get("entries", {})
-        if not entries:
-            return ""
-        user_cnt = sum(1 for v in entries.values() if v.get("source") == "user_stated")
-        llm_cnt = sum(1 for v in entries.values() if v.get("source") == "llm_inferred")
-        total = len(entries)
-        return f"⚠️ {total}条记忆中 {llm_cnt}条为AI推断(llm_inferred)，{user_cnt}条为你陈述(user_stated)——引用推断条目需核实"
-    except Exception:
-        return ""
 
 
 def _merge_meta_entry(meta: dict, content: str, source: str = None) -> bool:
@@ -1022,15 +1001,6 @@ def _meta_lock_ctx():
         return _ctx.nullcontext()
 
 
-def _parse_ttl(ttl_str: str):
-    """解析 TTL 字符串 -> 天数（None = permanent）"""
-    import re as _re
-    if ttl_str in ("permanent", None):
-        return None
-    match = _re.match(r'^(\d+)d$', str(ttl_str))
-    if match:
-        return int(match.group(1))
-    return 14
 
 
 def _prune_orphan_meta() -> int:
@@ -1231,3 +1201,9 @@ def _write_meta_atomic(meta_path, meta) -> None:
         f.flush()
         _os.fsync(f.fileno())
     _os.replace(tmp, meta_path)
+
+
+
+
+
+

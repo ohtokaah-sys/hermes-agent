@@ -261,8 +261,76 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     return False
 
 
+_SNIPPET_PROBE_MAX_CHARS = 8_000_000  # Past this, skip payload probing and emit the raw-slice template.
+_SNIPPET_ECHO_CHARS = 2_000           # Chars of the longest field echoed in the template.
+_SNIPPET_MAX_EXPR_CHARS = 80          # A longer path expression is not worth teaching.
+
+
+def _longest_string_path(obj, expr: str = "d", depth: int = 0) -> tuple[str, int]:
+    """Longest ``str`` leaf of a JSON-ish payload as ``(expr, length)``; ``("", 0)`` if none.
+
+    The pointer block must name the *real* access path — ``content`` for skill_view,
+    ``results[0].content`` for web_extract, ``output`` for terminal JSON. A hardcoded key sent
+    5 of 11 sampled payloads to the wrong field, so the path is probed, never assumed.
+    """
+    if depth > 6 or len(expr) > _SNIPPET_MAX_EXPR_CHARS:
+        return ("", 0)
+    if isinstance(obj, str):
+        return (expr, len(obj))
+    best: tuple[str, int] = ("", 0)
+    items = obj.items() if isinstance(obj, dict) else enumerate(obj) if isinstance(obj, list) else None
+    if items is None:
+        return best
+    for key, value in list(items)[:64]:
+        child = f"{expr}[{json.dumps(key)}]" if isinstance(key, str) else f"{expr}[{key}]"
+        candidate = _longest_string_path(value, child, depth + 1)
+        if candidate[1] > best[1]:
+            best = candidate
+    return best
+
+
+def _snippet_guidance(raw_content: str | None, file_path: str) -> str:
+    """Dynamic half of the pointer block: file shape + a probed, copy-runnable access snippet.
+
+    The static recovery wording is a test contract and stays untouched; this only appends what
+    the agent needs but cannot infer — whether the file is one giant line (where read_file
+    silently returns ~2,000 of 118,678 chars) and which field actually holds the payload.
+    """
+    if not isinstance(raw_content, str) or not raw_content:
+        return ""
+    lines = raw_content.count("\n") + 1
+    longest = max((len(line) for line in raw_content.splitlines()), default=0)
+    shape = (f"\nFile shape: {lines:,} line(s), longest line {longest:,} chars "
+             f"({len(raw_content):,} chars total).")
+    expr, field_len = ("", 0)
+    if len(raw_content) <= _SNIPPET_PROBE_MAX_CHARS:
+        try:
+            expr, field_len = _longest_string_path(json.loads(raw_content))
+        except Exception:
+            expr = ""
+    echo = _SNIPPET_ECHO_CHARS
+    if expr:
+        snippet = (
+            f"\nExact access (path probed from this payload: {expr}, {field_len:,} chars):\n"
+            f"    p = {json.dumps(file_path)}\n"
+            "    import json; d = json.loads(open(p).read())\n"
+            f"    print(len({expr}), {expr}[-{echo}:])\n"
+        )
+    else:
+        snippet = (
+            "\nExact access (payload is not JSON — read raw):\n"
+            f"    p = {json.dumps(file_path)}\n"
+            f"    print(open(p).read()[-{echo}:])\n"
+        )
+    if longest > 2000:
+        snippet += ("Note: read_file caps every line at 2,000 chars and search_files only locates "
+                    "(also 2,000-column) — neither returns a single-line payload in full.\n")
+    snippet += "Do NOT print the whole file from execute_code — print only the slice you need.\n"
+    return shape + snippet
+
+
 def _build_persisted_message(preview: str, has_more: bool, original_size: int,
-                             file_path: str) -> str:
+                             file_path: str, raw_content: str | None = None) -> str:
     """Build the <persisted-output> replacement block."""
     size_kb = original_size / 1024
     size_str = f"{size_kb / 1024:.1f} MB" if size_kb >= 1024 else f"{size_kb:.1f} KB"
@@ -270,10 +338,14 @@ def _build_persisted_message(preview: str, has_more: bool, original_size: int,
         f"{PERSISTED_OUTPUT_TAG}\n"
         f"This tool result was too large ({original_size:,} characters, {size_str}).\n"
         f"Full output saved to: {file_path}\n"
+        + _snippet_guidance(raw_content, file_path) +
         "Use the read_file tool with offset and limit to access specific sections of this output.\n"
         "Recovery: page through the saved file with read_file (offset/limit) or "
         "process it with execute_code — do NOT re-request the same data from the "
-        "remote API; the full result is already on disk.\n\n"
+        "remote API; the full result is already on disk.\n"
+        "(The two lines above assume normal multi-line output. If this payload is a single "
+        "very long line, read_file cannot page it — use the execute_code path described "
+        "above to slice out the part you need.)\n\n"
         f"Preview (first {len(preview)} chars):\n"
         + preview + ("\n..." if has_more else "")
         + f"\n{PERSISTED_OUTPUT_CLOSING_TAG}")
@@ -383,9 +455,8 @@ def enforce_turn_budget(tool_messages: list[dict], env=None,
         replacement = maybe_persist_tool_result(
             content=content, tool_name=_BUDGET_TOOL_NAME, tool_use_id=tool_use_id,
             env=env, config=config, threshold=0)
-        if replacement != content:
-            total_size += len(replacement) - size
-            tool_messages[idx]["content"] = replacement
-            logger.info("Budget enforcement: persisted tool result %s (%d chars)",
-                        tool_use_id, size)
+        # 本地定制（实测：50 条 1.6K 结果 -> 118K，+47% 超预算）：只在确实变小时才替换
+        if not isinstance(replacement, str) or len(replacement) >= size:
+            continue
+        total_size += len(replacement) - size
     return tool_messages

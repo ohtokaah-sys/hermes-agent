@@ -298,6 +298,29 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
     return " ".join(g for g in tool_guidance if g) or None
 
 
+def _layered_skill_names() -> "frozenset[str]":
+    """11.3 技能块分层：名字保留、描述折叠的那批 skill（config `skills.index_layering`）。
+
+    名单来自**固化快照**（rsync 式重生成见 scripts/regen_skill_layering_snapshot.py），
+    不按实时计数生成 —— 否则系统提示每轮字节变化，缓存全灭。任何异常都退化为空集
+    （= 现行全描述行为），永不隐藏 skill。
+    """
+    try:
+        import json, os
+        from hermes_cli.config import load_config_readonly
+        cfg = ((load_config_readonly() or {}).get("skills") or {}).get("index_layering") or {}
+        if not cfg.get("enabled"):
+            return frozenset()
+        path = os.path.expanduser(str(cfg.get("folded_snapshot") or ""))
+        if not path or not os.path.isfile(path):
+            return frozenset()
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return frozenset(str(n) for n in (data.get("folded_skills") or []) if str(n).strip())
+    except Exception:
+        return frozenset()
+
+
 def _skills_prompt(agent: Any) -> str:
     """Skills index (empty without skills tools).  Focus mode demotes non-coding
     categories to names-only — never hidden, every name stays visible."""
@@ -311,7 +334,9 @@ def _skills_prompt(agent: Any) -> str:
     except Exception:
         _compact_cats = frozenset()
     return _pb.build_skills_system_prompt(available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
-                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent))
+                                         compact_categories=_compact_cats or None,
+                                         compact_skills=_layered_skill_names() or None,
+                                         skills_dir_override=_agent_skills_dir(agent))
 
 
 def _auto_load_parts(agent: Any) -> list[str]:

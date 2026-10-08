@@ -234,7 +234,18 @@ def gateway_lifecycle_block(
     unsafe, refusal = scan_gateway_lifecycle(
         command,
         cwd=guard_cwd,
-        read_remote_script=lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES),
+        # Local backend: the guard's own local read already covers every reachable file, so a
+        # miss means the path simply does not exist. Charging those misses as "remote reads"
+        # burned the 64-read budget on ordinary string tokens (echo text, grep arguments,
+        # nonexistent paths) and then fail-closed on commands containing no lifecycle verb at
+        # all — the reported "false block on plain read-only commands" symptom. Remote
+        # backends keep the fallback, so an unscanned script can never hide a lifecycle command.
+        # Keyed on the ENVIRONMENT (`is_local`), not on `env_type`: a config-declared local
+        # backend can still be backed by a remote env object that resolves remote-only paths.
+        read_remote_script=(
+            None if getattr(env, "is_local", False)
+            else lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES)
+        ),
     )
     if unsafe and refusal:
         # Not a lifecycle command: a script the command EXECUTES could not be scanned (budget,

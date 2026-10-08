@@ -33,8 +33,7 @@ from urllib.parse import urlparse
 from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_json_write, env_float, file_signature, is_truthy_value
-from hermes_cli.auth_zai_kimi import (
-    KIMI_CODE_BASE_URL, ZAI_ENDPOINTS, _normalize_lmstudio_runtime_base_url, _resolve_kimi_base_url,
+from hermes_cli.auth_zai_kimi import (    KIMI_CODE_BASE_URL, ZAI_ENDPOINTS, _normalize_lmstudio_runtime_base_url, _resolve_kimi_base_url,
     _resolve_zai_base_url, detect_zai_endpoint)
 from hermes_cli.auth_model_picker import (
     _prompt_model_selection, _save_model_choice)
