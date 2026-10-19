@@ -524,6 +524,24 @@ all = [
   "hermes-agent[youtube]",
 ]
 
+# ── 本地扩展（非上游 · 2026-10-19 加）───────────────────────────────────────
+# 供 cron 的向量检索 / 中文分词 / PDF·Office 提取使用。这些包历史上只用 pip 装在
+# in-tree venv（hermes-agent/venv）里，**不在 uv.lock 中** ⇒ PM 依赖代次里没有；
+# 2026-10-19 升级窗口的 cron 崩溃（ModuleNotFoundError: faiss / jieba / fitz）就是这条。
+# 显式启用：`hermes pm install --extra kaah-vector`（已列入 opt-in-extras，
+# 交付 bundle 用 --all-extras 时会 skip 它，不给海诺/小团客户端增重）。
+# 版本逐字对齐 in-tree venv 实测值，避免与既有 FAISS 索引 / 分词 / 提取结果漂移。
+kaah-vector = [
+  "faiss-cpu==1.14.2",
+  "jieba==0.42.1",
+  "rank-bm25==0.2.2",
+  "pymupdf==1.27.2.3",
+  "python-docx==1.2.0",
+  "python-pptx==1.0.2",
+  "openpyxl==3.1.5",
+  "pandas==3.0.3",
+]
+
 [dependency-groups]
 # Build and test tooling never ships in runtime payloads.
 dev = [
@@ -563,7 +581,7 @@ hermes-acp = "acp_adapter.entry:main"
 # build with --all-extras and pass --no-extra for each of these, so their
 # closures never ship. KittenTTS pulls torch, transformers and spaCy through
 # misaki[en]: installed when the user picks it, not preinstalled.
-opt-in-extras = ["kittentts"]
+opt-in-extras = ["kittentts", "kaah-vector"]
 
 # Per-extra platform gates (settled 2026-09-02): an extra listed here is
 # only installable on platforms matching the marker. pm consults this
