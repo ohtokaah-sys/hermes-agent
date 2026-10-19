@@ -3,7 +3,7 @@ the WSL / MSIX stubs never win (#116818). Host-independent — the candidate
 ladder takes the ``which`` result and env as arguments."""
 import pytest
 
-from pm.shell import windows_bash_candidates
+from pm.shell import git_install_roots, windows_bash_candidates
 
 PF = r"D:\Progs"
 
@@ -38,3 +38,19 @@ def test_nonstarting_bash_is_rejected(monkeypatch):
 
     monkeypatch.setattr(shell.subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 1))
     assert shell._bash_starts("broken-bash.exe") is False
+
+
+def test_git_on_path_outside_program_files_is_a_candidate():
+    """Huawei AppGallery-style install: git.exe in <root>/cmd, bash in <root>/bin.
+
+    The Program Files ladder and `which bash` both miss it, which is exactly the
+    "Git Bash not found" report from a machine that does have Git (#海诺2.0 #6).
+    """
+    roots = git_install_roots({}, git_path=r"D:\AppGallery\Git\cmd\git.exe")
+    assert roots == [r"D:\AppGallery\Git"]
+    candidates = windows_bash_candidates(None, {"ProgramFiles": PF}, roots)
+    assert r"D:\AppGallery\Git\bin\bash.exe" in candidates
+
+
+def test_git_install_roots_ignores_a_git_that_is_not_under_cmd_or_bin():
+    assert git_install_roots({}, git_path=r"C:\Windows\system32\notepad.exe") == []

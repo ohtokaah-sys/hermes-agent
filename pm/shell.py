@@ -27,7 +27,7 @@ import ntpath
 import os
 import shutil
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 from pm import paths
 from pm.lock import Facts
@@ -65,11 +65,18 @@ def _staged_bash() -> str | None:
 _WINDOWS_BASH_STUB_DIRS = ("system32", "windowsapps")
 
 
-def windows_bash_candidates(on_path: str | None, env: Mapping[str, str]) -> list[str]:
+def windows_bash_candidates(on_path: str | None, env: Mapping[str, str],
+                            extra_roots: Sequence[str] = ()) -> list[str]:
     """Ordered bash.exe candidates for a Windows host, as pure data: the
     explicit override and Git for Windows roots first, then ``on_path``
     (the ``shutil.which("bash")`` result) unless it is a stub. System32
-    precedes Git on most PATHs (#116818)."""
+    precedes Git on most PATHs (#116818).
+
+    ``extra_roots`` carries Git roots the env ladder cannot see (see
+    :func:`git_install_roots`): vendor installers such as Huawei AppGallery put
+    Git under ``D:\\AppGallery\\Git`` and only add ``cmd\\`` to PATH, so both
+    the Program Files ladder and ``which bash`` miss it.
+    """
     programfiles = env.get("ProgramFiles", r"C:\Program Files")
     candidates = []
     if env.get("HERMES_GIT_BASH_PATH"):
@@ -80,6 +87,7 @@ def windows_bash_candidates(on_path: str | None, env: Mapping[str, str]) -> list
     if env.get("LOCALAPPDATA"):
         roots.extend((ntpath.join(env["LOCALAPPDATA"], "hermes", "git"),
                       ntpath.join(env["LOCALAPPDATA"], "Programs", "Git")))
+    roots.extend(root for root in extra_roots if root)
     for root in roots:
         candidates.extend((ntpath.join(root, "bin", "bash.exe"),
                            ntpath.join(root, "usr", "bin", "bash.exe")))
@@ -88,6 +96,39 @@ def windows_bash_candidates(on_path: str | None, env: Mapping[str, str]) -> list
         if not any(stub in norm for stub in _WINDOWS_BASH_STUB_DIRS):
             candidates.append(on_path)
     return list(dict.fromkeys(candidates))
+
+
+def git_install_roots(env: Mapping[str, str], git_path: str | None = None) -> list[str]:
+    """Git for Windows install roots that no environment variable names.
+
+    Two sources:
+
+    * ``Software\\GitForWindows`` ``InstallPath`` (HKLM, then HKCU) — what Git's
+      own installer records, wherever the user installed it;
+    * the root implied by ``git`` on PATH — vendor installers still expose
+      ``cmd\\git.exe``, so ``<root>\\bin\\bash.exe`` sits one level over.
+    """
+    roots: list[str] = []
+    if os.name == "nt":  # pragma: no cover - Windows-only registry read
+        try:
+            import winreg
+        except ImportError:
+            winreg = None  # type: ignore[assignment]
+        if winreg is not None:
+            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                try:
+                    with winreg.OpenKey(hive, r"SOFTWARE\GitForWindows") as key:
+                        value, _ = winreg.QueryValueEx(key, "InstallPath")
+                except OSError:
+                    continue
+                if isinstance(value, str) and value.strip():
+                    roots.append(value.strip())
+    resolved = git_path if git_path is not None else shutil.which("git")
+    if resolved:
+        parent = ntpath.dirname(resolved)
+        if ntpath.basename(parent).lower() in ("cmd", "bin"):
+            roots.append(ntpath.dirname(parent))
+    return list(dict.fromkeys(root for root in roots if root))
 
 
 def _bash_starts(candidate: str) -> bool:
@@ -111,7 +152,8 @@ def bash() -> str | None:
 
     on_path = shutil.which("bash")
     if os.name == "nt":
-        return next((c for c in windows_bash_candidates(on_path, os.environ)
+        extra_roots = git_install_roots(os.environ)
+        return next((c for c in windows_bash_candidates(on_path, os.environ, extra_roots)
                      if os.path.isfile(c) and _bash_starts(c)), None)
     if on_path:
         return on_path
