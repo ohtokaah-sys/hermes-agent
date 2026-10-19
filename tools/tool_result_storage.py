@@ -445,12 +445,15 @@ def enforce_turn_budget(tool_messages: list[dict], env=None,
             break
         content = tool_messages[idx]["content"]
         tool_use_id = tool_messages[idx].get("tool_call_id", f"budget_{idx}")
+        # 本地定制：日志里带真实工具名（_BUDGET_TOOL_NAME 定位不到来源）
+        tool_name = (tool_messages[idx].get("name")
+                     or tool_messages[idx].get("tool_name") or "?")
         if isinstance(content, list):
             parts, saved = _spill_largest_text_part(content, tool_use_id, env, config)
             if saved:
                 total_size -= saved
                 tool_messages[idx]["content"] = parts
-                logger.info("Budget enforcement: persisted a text part of tool result %s (%d chars)", tool_use_id, saved)
+                logger.info("Budget enforcement: persisted a text part of %s result %s (%d chars)", tool_name, tool_use_id, saved)
             continue
         replacement = maybe_persist_tool_result(
             content=content, tool_name=_BUDGET_TOOL_NAME, tool_use_id=tool_use_id,
@@ -459,4 +462,7 @@ def enforce_turn_budget(tool_messages: list[dict], env=None,
         if not isinstance(replacement, str) or len(replacement) >= size:
             continue
         total_size += len(replacement) - size
+        tool_messages[idx]["content"] = replacement
+        logger.info("Budget enforcement: persisted tool result %s (%s, %d chars)",
+                    tool_use_id, tool_name, size)
     return tool_messages

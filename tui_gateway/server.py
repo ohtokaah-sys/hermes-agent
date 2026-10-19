@@ -392,6 +392,9 @@ def _load_interim_assistant_messages() -> bool:
 
 def _shutdown_sessions() -> None:
     # Durable-first: flush transcripts (bounded budget) BEFORE the slow teardown so a supervisor SIGKILL can't lose them.
+    # 本地修复（上游 v0.22.2 缺陷）：_flush_sessions_before_exit 定义在 session_reaper.py 但未导入本模块，
+    # atexit 路径直接 NameError → 退出前不落盘 transcript。此处延迟导入。
+    from .session_reaper import _flush_sessions_before_exit
     for step in (_flush_sessions_before_exit, _release_gateway_wake_owner, _stop_turns_before_exit):
         with contextlib.suppress(Exception):
             step()

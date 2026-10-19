@@ -231,7 +231,7 @@ def memory_tool(action: str | None = None, target: str = "memory", content: str 
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
     token = FAILURE_CLASS.set("other")
     try:
-        outcome, result = _memory_tool(action, target, content, old_text, new_text, operations, store, query)
+        outcome, result = _memory_tool(action, target, content, old_text, new_text, operations, store, query=query)
         failure_class = "none" if outcome == "success" else FAILURE_CLASS.get()
     finally:
         FAILURE_CLASS.reset(token)
@@ -345,7 +345,8 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store,
             from memory_routing import check_route
             route = check_route(content, target)
             if route.get("action") == "block":
-                return _applied({                    "success": False,
+                return _applied({
+                    "success": False,
                     "status": "routed_to_kaah",
                     "message": "事件类记忆已自动转存 kaah 归档（不占常驻 MEMORY）",
                     "archive_path": route.get("archive_path", ""),
@@ -355,7 +356,8 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store,
             elif route.get("action") == "write_with_warning":
                 content = "⚠️未分类 " + content
         except Exception:
-            pass  # 分流模块失败 → fail open，不阻断记忆写入    result = _STORE_ACTIONS[action][0](store, target, content, old_text)
+            pass  # 分流模块失败 → fail open，不阻断记忆写入
+    result = _STORE_ACTIONS[action][0](store, target, content, old_text)
     if target == "memory" and isinstance(result, dict) and result.get("success"):
         if action in ("add", "replace"):
             _record_memory_meta(content)
@@ -560,7 +562,7 @@ registry.register(
     toolset="memory",
     schema=MEMORY_SCHEMA,
     handler=lambda args, **kw: memory_tool(
-        action=args.get("action", ""), target=args.get("target", "memory"), store=kw.get("store"),
+        action=args.get("action", ""), target=args.get("target"), store=kw.get("store"),
         query=args.get("query"),
         **{k: args.get(k) for k in ("content", "old_text", "new_text", "operations")}),
     check_fn=check_memory_requirements,

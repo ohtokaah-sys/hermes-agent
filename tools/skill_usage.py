@@ -503,6 +503,10 @@ def bump_use(skill_name: str, *, task_id: Optional[str] = None, session_id: Opti
         reuse_after_patch = uses > 0 and gen > last_reused
         rec.update(use_count=uses + 1, last_used_at=_now_iso(), patch_generation=gen,
                    last_reused_patch_generation=gen if reuse_after_patch else last_reused)
+        # 刚被使用 → 立即复活生命周期状态（否则 state 会停在 stale，直到下一次 curator 跑）
+        # 归档状态不在此处改动：归档是 curator / LLM 的判断，不由「用了一次」翻转。
+        if rec.get("state") in (None, "", STATE_STALE):
+            rec["state"] = STATE_ACTIVE
         return {"created_by": rec.get("created_by"), "use_count": uses + 1, "reused": uses > 0,
                 "reuse_after_patch": reuse_after_patch}
     _mutate_and_emit(skill_name, "loaded", _apply, task_id=task_id, session_id=session_id)
@@ -638,7 +642,10 @@ def archive_skill(skill_name: str) -> tuple[bool, str]:
     except OSError as e:
         return False, f"failed to create archive dir: {e}"
     if dest.exists():
-        dest = dest.with_name(f"{skill_dir.name}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}")
+        # 冲突回退也用 skill NAME（不是目录名）：与上面「Flatten under the skill NAME」一致，
+        # 否则嵌套 skill（目录名 ≠ frontmatter name）归档后破坏「目录名 == skill 名」契约，
+        # restore_skill 的 `<name>-<ts>` 匹配也会找不到它。
+        dest = dest.with_name(f"{skill_name}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}")
     # complete_package: consolidation may have re-homed support files first, so a disk-only capture can come
     # back hollow; the fill from the newest curator backup keeps rollback restorable.
     return _relocate(skill_dir, dest, skill_name, "archive", complete_package=True, skill=skill_name)
