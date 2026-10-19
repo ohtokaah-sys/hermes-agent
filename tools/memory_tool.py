@@ -221,6 +221,31 @@ def _background_delete_gate(store, action, operations, target="memory", content=
             "batch); 'add' is still available.", success=False)
 
 
+def _import_from_scripts(module_name: str):
+    """从当前 profile 的 ``scripts/`` 导入模块，导入后立刻把该目录移出 ``sys.path``。
+
+    本地定制模块（memory_routing / memory_meta_lock / memory_semantic_fallback）不在包里，
+    只能按路径加载；但**永久** insert sys.path 会污染进程，测试的 home_io_guard 会把
+    后续任何 realpath 扫描判成「测试读写真实 hermes home」而误杀（2026-10-19 实测）。
+    """
+    import importlib
+    cached = sys.modules.get(module_name)
+    if cached is not None:
+        return cached
+    scripts_dir = str(get_hermes_home() / "scripts")
+    added = scripts_dir not in sys.path
+    if added:
+        sys.path.insert(0, scripts_dir)
+    try:
+        return importlib.import_module(module_name)
+    finally:
+        if added:
+            try:
+                sys.path.remove(scripts_dir)
+            except ValueError:
+                pass
+
+
 def memory_tool(action: str | None = None, target: str = "memory", content: str | None = None, old_text: str | None = None,
                 new_text: str | None = None, operations: Optional[list[dict[str, Any]]] = None,
                 store: Optional[MemoryStore] = None, query: Optional[str] = None) -> str:
@@ -341,8 +366,7 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store,
     # ── 本地定制：写入分流（规则类→正常写；事件类→转存 kaah；unknown→写入+警告头）──
     if action == "add" and target == "memory" and content:
         try:
-            sys.path.insert(0, str(get_hermes_home() / "scripts"))
-            from memory_routing import check_route
+            check_route = _import_from_scripts("memory_routing").check_route
             route = check_route(content, target)
             if route.get("action") == "block":
                 return _applied({
@@ -991,11 +1015,7 @@ def _meta_lock_ctx():
     （它按 HERMES_HOME 定位，沙箱可用）。
     """
     try:
-        import sys as _sys
-        _p = str(get_hermes_home() / "scripts")
-        if _p not in _sys.path:
-            _sys.path.insert(0, _p)
-        from memory_meta_lock import meta_lock
+        meta_lock = _import_from_scripts("memory_meta_lock").meta_lock
         return meta_lock(5.0)
     except Exception:
         import contextlib as _ctx
@@ -1089,8 +1109,7 @@ def _semantic_fallback(query: str, full_content: str, target: str):
     try:
         # 2026-10-17 审查：路径必须跟随当前 profile（原写死 Path.home()/.hermes，
         # 非默认 profile 下会加载默认 home 的脚本，异常又被吞 ⇒ L2 兜底静默失效）。
-        sys.path.insert(0, str(get_hermes_home() / "scripts"))
-        from memory_semantic_fallback import semantic_match
+        semantic_match = _import_from_scripts("memory_semantic_fallback").semantic_match
         return semantic_match(query, full_content, target)
     except Exception:
         return None

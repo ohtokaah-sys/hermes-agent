@@ -11,8 +11,15 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path.home() / ".hermes" / "scripts"))
-import memory_semantic_fallback as msf
+_SCRIPTS = str(Path.home() / ".hermes" / "scripts")
+sys.path.insert(0, _SCRIPTS)
+import memory_semantic_fallback as msf  # noqa: E402
+# 立刻摘掉：这个目录留 sys.path 里会让后续测试的 home_io_guard 把 realpath 扫描判成
+# 「读写真实 hermes home」而误杀（2026-10-19 实测：cron/test_atomic_paused_creation 连带失败）。
+try:
+    sys.path.remove(_SCRIPTS)
+except ValueError:  # pragma: no cover
+    pass
 
 
 @pytest.fixture(autouse=True)
@@ -22,8 +29,16 @@ def reset_backoff():
 
 
 @pytest.fixture()
-def mock_api(monkeypatch):
-    """替换 urlopen 返回指定 content（模拟 Flash 响应）。"""
+def mock_api(monkeypatch, tmp_path):
+    """替换 urlopen 返回指定 content（模拟 Flash 响应）。
+
+    2026-10-19 升级适配：v0.22.2 conftest 装 home_io_guard，禁止测试读真实 ~/.hermes；
+    模块直读 .deepseek_key 会被拦 → 异常被吞 → semantic_match 返回 None。
+    这里把 key 指向临时文件，保持测试隔离（不解除护栏）。
+    """
+    key_file = tmp_path / ".deepseek_key"
+    key_file.write_text("sk-test-dummy", encoding="utf-8")
+    monkeypatch.setattr(msf, "_DS_KEY_FILE", str(key_file))
     responses = []
 
     def fake_urlopen(req, timeout=None):

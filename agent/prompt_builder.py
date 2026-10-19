@@ -1355,7 +1355,8 @@ def _current_session_platform_hint() -> str:
 
 def build_skills_system_prompt(
     available_tools: set[str] | None = None, available_toolsets: set[str] | None = None,
-    compact_categories: frozenset[str] | None = None, skills_dir_override: Path | None = None,) -> str:
+    compact_categories: frozenset[str] | None = None, skills_dir_override: Path | None = None,
+    compact_skills: frozenset[str] | None = None,) -> str:
     """Compact skill index for the system prompt.
 
     Same-named skills resolve like skill_view: project > local > create_dir > external_dirs, and a
@@ -1377,7 +1378,7 @@ def build_skills_system_prompt(
         if not skills_dir.exists() and not extra_roots:
             return ""
         return _build_skills_system_prompt_inner(
-            skills_dir, extra_roots, available_tools, available_toolsets, compact_categories)
+            skills_dir, extra_roots, available_tools, available_toolsets, compact_categories, compact_skills)
     finally:
         if _home_token is not None:
             reset_hermes_home_override(_home_token)
@@ -1426,7 +1427,8 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
 
 def _render_skills_index(
     skills_by_category: dict[str, list[tuple[str, str]]], category_descriptions: dict[str, str],
-    compact_categories: frozenset[str] | None, available_tools: set[str] | None, unloadable: list[str] = (),) -> str:
+    compact_categories: frozenset[str] | None, available_tools: set[str] | None, unloadable: list[str] = (),
+    compact_skills: frozenset[str] | None = None,) -> str:
     """Render the ## Skills block; "" when there is nothing to list. *unloadable* names (different skills
     sharing a name AND relative path within one tier — one root or several) get a rename note instead of a row skill_view would refuse."""
     if not skills_by_category:
@@ -1507,7 +1509,8 @@ def _oneshot_prompt_variant() -> bool:
 
 def _build_skills_system_prompt_inner(
     skills_dir: Path, extra_roots: list[tuple[int, Path]], available_tools: set[str] | None,
-    available_toolsets: set[str] | None, compact_categories: frozenset[str] | None,) -> str:
+    available_toolsets: set[str] | None, compact_categories: frozenset[str] | None,
+    compact_skills: frozenset[str] | None = None,) -> str:
     # The resolved platform is part of the key: per-platform disabled-skill lists need distinct cache entries.
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
@@ -1525,6 +1528,7 @@ def _build_skills_system_prompt_inner(
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
+        tuple(sorted(compact_skills or ())),
         _oneshot_prompt_variant(), tuple(plugin_rows),    )
     snapshot = _load_skills_snapshot(skills_dir, manifest)
     app_gated = snapshot is not None and any(
@@ -1594,7 +1598,8 @@ def _build_skills_system_prompt_inner(
             logger.debug("Could not write skills prompt snapshot: %s", e)
 
     unloadable = sorted({e["name"] for e in visible_entries if not e["load_name"]})
-    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools, unloadable)
+    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools, unloadable,
+                                  compact_skills)
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
