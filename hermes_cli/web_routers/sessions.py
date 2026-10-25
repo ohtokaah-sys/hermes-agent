@@ -652,6 +652,12 @@ def _is_untyped_scaffold_notice(message) -> bool:
     return isinstance(content, str) and content.lstrip().startswith("[System:")
 
 
+def _strip_gateway_origin_envelope(content) -> str | None:
+    """Return the user's own words when *content* is a gateway busy-path envelope."""
+    from agent.gateway_origin import strip
+    return strip(content)
+
+
 def _project_for_display(messages: list, *, home=None, inline_images: bool = True) -> list:
     """Replace compaction summaries with their display-only projection and hide untyped
     gateway-scaffold notices.
@@ -702,6 +708,12 @@ def _project_for_display(messages: list, *, home=None, inline_images: bool = Tru
         if message.get("role") == "user" and message.get("display_kind") == STEER_DISPLAY_KIND and (
                 steer_text := _extract_steer_text_from_message(message)):
             message = {**message, "display_content": steer_text}
+        # Gateway busy-path envelope: the routing header is model-facing, not the user's words.
+        # The web UI renders ``content`` directly, so replace it in this display-only projection
+        # (the DB row is untouched); ``display_content`` is kept for the Desktop renderer.
+        if message.get("role") == "user" and (
+                own_text := _strip_gateway_origin_envelope(message.get("content"))):
+            message = {**message, "content": own_text, "display_content": own_text}
         if not is_compaction_summary_message(message):
             projected_messages.append(message)
             continue
