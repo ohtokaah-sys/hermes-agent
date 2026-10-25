@@ -22,6 +22,15 @@ dependencies = [
   # at any time without a code review on our side. Exact pins mean the
   # only way a new package version reaches a user is via an intentional
   # update on our end (bump the pin in this file, regenerate uv.lock).
+  #
+  # 2026-10-21 审查修（队列 4f94d0d8 / 695120dd / 4023ee3c / 4a177418 / f1d10adf /
+  # 5482fbcb / 227c869c）：上面这句曾经与事实不符 —— 下列依赖用的是**下界范围**
+  # （`>=x,<y`）而不是 == 精确固定：urllib3 / fastapi / uvicorn / httptools /
+  # watchfiles / python-multipart / ptyprocess / pywinpty / pywin32 / winrt-* /
+  # pillow-heif / nemo-relay。每一处都带 CVE 或平台约束注释（下界就是安全修复版本）。
+  # 这里的口径改为如实描述：核心依赖**以精确 pin 为默认**，HTTP/dashboard 栈这批
+  # 属已记录的例外；要把它们收回 == 需要同时改 pin 并 `hermes pm lock`（上游动作，
+  # 不在本地单独做）。新增核心依赖时仍按默认规则用 ==。
   # This was tightened on 2026-05-12 in response to the Mini Shai-Hulud
   # worm hitting mistralai 2.4.6 on PyPI; if that release had been
   # captured by `mistralai>=2.3.0,<3` rather than an exact pin, every

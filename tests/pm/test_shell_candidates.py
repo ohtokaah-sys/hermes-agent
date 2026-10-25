@@ -40,17 +40,27 @@ def test_nonstarting_bash_is_rejected(monkeypatch):
     assert shell._bash_starts("broken-bash.exe") is False
 
 
-def test_git_on_path_outside_program_files_is_a_candidate():
-    """Huawei AppGallery-style install: git.exe in <root>/cmd, bash in <root>/bin.
+def test_git_on_path_outside_program_files_is_a_candidate(monkeypatch):
+    """Vendor-store install: git.exe in <root>/cmd, bash in <root>/bin.
 
     The Program Files ladder and `which bash` both miss it, which is exactly the
-    "Git Bash not found" report from a machine that does have Git (#海诺2.0 #6).
+    "Git Bash not found" report from a machine that does have Git.
+
+    2026-10-21 审查修（队列 62b9ee66）：去掉具名厂商/内部工单标签（隐私）。
+    2026-10-21 审查修（队列 4c1207c8）：把注册表读取打桩，避免在装了 Git for Windows
+    的 Windows 上读到真实 ``InstallPath`` 而多出 root、精确断言失败。
     """
-    roots = git_install_roots({}, git_path=r"D:\AppGallery\Git\cmd\git.exe")
-    assert roots == [r"D:\AppGallery\Git"]
+    from pm import shell
+
+    monkeypatch.setattr(shell, "_registry_git_roots", lambda: [])
+    roots = git_install_roots({}, git_path=r"D:\VendorStore\Git\cmd\git.exe")
+    assert roots == [r"D:\VendorStore\Git"]
     candidates = windows_bash_candidates(None, {"ProgramFiles": PF}, roots)
-    assert r"D:\AppGallery\Git\bin\bash.exe" in candidates
+    assert r"D:\VendorStore\Git\bin\bash.exe" in candidates
 
 
-def test_git_install_roots_ignores_a_git_that_is_not_under_cmd_or_bin():
+def test_git_install_roots_ignores_a_git_that_is_not_under_cmd_or_bin(monkeypatch):
+    from pm import shell
+
+    monkeypatch.setattr(shell, "_registry_git_roots", lambda: [])
     assert git_install_roots({}, git_path=r"C:\Windows\system32\notepad.exe") == []

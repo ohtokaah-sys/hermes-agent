@@ -1710,11 +1710,8 @@ def _deliver_via_live_adapter(
         if adapter_ok and not timed_out and media_files:
             _live_send_media(t, media_metadata, media_files, delivery_errors)
         elif timed_out and media_files:
-            _note_target_error(
-                job,
-                f"{len(media_files)} media attachment(s) not delivered to "
-                f"{t.where} (live adapter confirmation timed out)",
-                delivery_errors)
+            # 2026-10-20：不再直接丢弃附件——转独立进程车道补发，失败才记错。
+            _standalone_media_fallback(t, media_files, delivery_errors)
 
         if adapter_ok:
             # Log WHERE it went: a ghost delivery in the wrong lane is otherwise indistinguishable.
@@ -1734,6 +1731,31 @@ def _deliver_via_live_adapter(
             target_errors.append(err_msg)
         _warn_live_lane_failure(job, err_msg, t.is_relay)
     return delivered
+
+
+def _standalone_media_fallback(
+    t: _TargetDelivery, media_files: list, delivery_errors: list,
+) -> None:
+    """Deliver media-only over the standalone lane after a live confirmation timeout.
+
+    2026-10-20: when a long turn occupies the gateway event loop, the text confirmation
+    burns its whole ``_LIVE_SEND_CONFIRM_TIMEOUT_SECS`` budget.  The old branch then threw
+    every attachment away and only recorded "failed" — so any cron delivery that collided
+    with a busy loop silently lost its file.  The attachment is the part users notice
+    missing, so retry it on the lane that does not depend on that loop.
+    """
+    result, err = _standalone_send(t, "", media_files)
+    if err:
+        _note_target_error(
+            t.job,
+            f"{len(media_files)} media attachment(s) not delivered to {t.where} "
+            f"(live adapter confirmation timed out; standalone retry failed: {err})",
+            delivery_errors)
+        return
+    logger.warning(
+        "Job '%s': %s media attachment(s) delivered to %s via standalone fallback "
+        "after live-adapter confirmation timeout",
+        t.job["id"], len(media_files), t.where)
 
 
 def _standalone_send(

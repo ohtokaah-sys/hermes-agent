@@ -354,6 +354,49 @@ def _git_env(
     return env
 
 
+def _index_lock_error(stderr) -> bool:
+    """True when git refused to start because an index.lock exists."""
+    text = stderr if isinstance(stderr, str) else ""
+    # Real message: "fatal: Unable to create
+    #   '/.../store/indexes/<hash>.lock': File exists."  -- the lock file is NOT
+    # literally named index.lock, so match on the git wording, not the filename.
+    return "Unable to create" in text and ".lock" in text and "File exists" in text
+
+
+def _clear_stale_index_locks(env, max_age: float = 120.0) -> int:
+    """Remove stale ``<index>.lock`` files left behind by killed git processes.
+
+    The shared store keeps one index per working directory.  A git process that
+    dies (timeout, OOM, gateway restart) leaves ``store/indexes/<hash>.lock``
+    behind, and *every* later ``git add`` on that project fails with rc=128
+    forever (observed 2026-10-17 and 2026-10-20: six leftovers, oldest 30 days).
+    Only locks older than ``max_age`` are removed so a live writer is never
+    disturbed.
+    """
+    candidates = []
+    idx = env.get("GIT_INDEX_FILE")
+    if idx:
+        candidates.append(Path(str(idx) + ".lock"))
+    git_dir = env.get("GIT_DIR")
+    if git_dir:
+        try:
+            candidates.extend(Path(git_dir, "indexes").glob("*.lock"))
+        except OSError:
+            pass
+    removed = 0
+    now = time.time()
+    for lock in candidates:
+        try:
+            if not lock.exists() or (now - lock.stat().st_mtime) < max_age:
+                continue
+            lock.unlink()
+            removed += 1
+            logger.warning("checkpoint: cleared stale git index lock %s", lock)
+        except OSError:
+            continue
+    return removed
+
+
 def _run_git(
     args: list[str],
     store: Path,
@@ -405,6 +448,21 @@ def _run_git(
             creationflags=windows_hide_flags(),
             check=False,
         )
+        if result.returncode != 0 and _index_lock_error(result.stderr):
+            # A dead git leaves index.lock behind; clear it once and retry so a
+            # single crash cannot disable checkpoints for that project forever.
+            if _clear_stale_index_locks(env):
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    **text_options,
+                    timeout=timeout,
+                    env=env,
+                    cwd=str(normalized_working_dir),
+                    stdin=subprocess.DEVNULL,
+                    creationflags=windows_hide_flags(),
+                    check=False,
+                )
         ok = result.returncode == 0
         stdout = os.fsdecode(result.stdout) if "-z" in args else result.stdout.strip()
         stderr = result.stderr.decode("utf-8", errors="replace").strip() if "-z" in args else result.stderr.strip()

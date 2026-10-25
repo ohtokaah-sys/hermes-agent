@@ -250,6 +250,13 @@ def _settings() -> dict:
         ttl = int(ttl_raw) if ttl_raw else _DEFAULT_TTL_SECONDS
     except ValueError:
         ttl = _DEFAULT_TTL_SECONDS
+    # 2026-10-22 产品补丁：子进程（如 cron.scheduler）的密钥被安全策略剥掉时不再假装「没配置」。
+    # 依据父进程写进来的 HERMES_STRIPPED_SECRET_KEYS（只含键名，不含值）：被剥且本进程没有
+    # config 层的 secret ⇒ 跳过注册，避免每次都生成随机签名密钥并打一条 INFO 噪音。
+    # 不服务 dashboard 的子进程本来也不需要这个 provider。
+    _stripped_names = {s.strip() for s in os.environ.get("HERMES_STRIPPED_SECRET_KEYS", "").split(",") if s.strip()}  # hygiene:ignore H009 只出现环境变量键名，无值
+    if "HERMES_DASHBOARD_BASIC_AUTH_SECRET" in _stripped_names and not section.get("secret"):  # hygiene:ignore H009 常量键名比对，无值
+        raise SkipRegistration("该子进程密钥被策略剥离且不服务 dashboard —— 跳过注册。", level="debug")
     return {"username": username, "password_hash": password_hash, "secret": _resolve_secret(section), "ttl_seconds": ttl}
 
 

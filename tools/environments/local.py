@@ -304,7 +304,20 @@ def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
     # already applies this invariant; Cron scripts use this sanitizer directly (#92998).
     if path_key is not None:
         out[path_key] = _prepend_hermes_bin_dir(fix_path(out.get(path_key, "")))
-    return _finalize_child_env(out)
+    env = _finalize_child_env(out)
+    # 2026-10-22 产品补丁：把「本进程被策略剥离掉的密钥**名字**」告诉子进程（只报键名，不含值）。
+    # 起因：cron.scheduler 等子进程会被剥掉 HERMES_DASHBOARD_BASIC_AUTH_SECRET，dashboard_auth
+    # 插件在子进程里读空后各自生成随机签名密钥并打一条 INFO，形成每分钟数条的噪音。子进程没有
+    # 「我被剥过什么」这个信息，就无法区分「没配置」与「被策略剥离」。只传键名，值仍不出父进程。
+    from tools.environments.local_env_policy import _STATIC_PROVIDER_ENV_BLOCKLIST
+    _candidates: set[str] = set()
+    for _items, _unwrap in parts:
+        if isinstance(_items, dict):
+            _candidates.update(_items)
+    _stripped = sorted(k for k in _candidates if k not in env and k in _STATIC_PROVIDER_ENV_BLOCKLIST)
+    if _stripped:
+        env["HERMES_STRIPPED_SECRET_KEYS"] = ",".join(_stripped)
+    return env
 
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:

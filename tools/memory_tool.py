@@ -333,6 +333,13 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store,
     if operations:
         if not isinstance(operations, list):
             return _invalid("operations must be a list of {action, content?, old_text?} objects.")
+        # 2026-10-20 修（回归）：元素级类型校验缺失 —— 下游 `(op or {}).get(...)` 遇到字符串
+        #   元素直接 AttributeError 逸出（不是干净拒绝），整批写入被异常打断。
+        #   判据：operations 的每个元素都必须是 dict（only objects）。
+        if any(not isinstance(op, dict) for op in operations):
+            return _invalid(
+                "operations must be a list of objects (only objects allowed): each entry must be "
+                "{action, content?, old_text?}. Nothing was written.")
         if any(isinstance(op, dict) and op.get("action") == "replace" for op in operations):
             return _invalid(_REPLACE_REMOVED)
         denied = _background_delete_gate(store, action, operations, target)
@@ -383,7 +390,10 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store,
             pass  # 分流模块失败 → fail open，不阻断记忆写入
     result = _STORE_ACTIONS[action][0](store, target, content, old_text)
     if target == "memory" and isinstance(result, dict) and result.get("success"):
-        if action in ("add", "replace"):
+        # 2026-10-20 修（回归）：上游已把 replace 换成 patch（_REPLACE_REMOVED），
+        #   但记账口径仍只认 add/replace ⇒ **patch 之后 MEMORY.md 变了、meta 没变**：
+        #   新正文无 meta（TTL 判「无日期」永久保留），旧 hash 变孤儿（被 prune 后连审计线索都没了）。
+        if action in ("add", "replace", "patch"):
             _record_memory_meta(content)
         elif action == "remove":
             _prune_orphan_meta()
@@ -464,11 +474,26 @@ def apply_memory_pending(payload: dict[str, Any], store: MemoryStore) -> dict[st
         return {"success": False, "error": "This destructive pending write predates entry pinning and cannot be "
                                            "verified; nothing was applied. Reject it and recreate the change."}
     if action == "batch":
-        return store.apply_batch(target, payload.get("operations") or [])
+        operations = payload.get("operations") or []
+        batch_result = store.apply_batch(target, operations)
+        # 2026-10-21 审查修（队列 a3bb97bf）：/memory approve 回放的批量写入原先完全没有 meta 记账 ——
+        #   新条目无 created_at/TTL（被 TTL 判据当「无日期」永久保留），被替换/删除的旧 hash 留在
+        #   memory_meta.json 里成孤儿（到期时写墓碑、并把 total/llm_inferred 统计顶高）。
+        #   与直接写入路径同口径：记新条目 + prune 孤儿。
+        _record_meta_for_operations(target, operations, batch_result)
+        return batch_result
     if action not in _STORE_ACTIONS:
         return {"success": False, "error": f"Unknown staged action '{action}'."}
-    return _STORE_ACTIONS[action][0](store, target, payload.get("content") or "", payload.get("old_text") or "",
-                                     payload.get("matched_entry"))
+    result = _STORE_ACTIONS[action][0](store, target, payload.get("content") or "", payload.get("old_text") or "",
+                                       payload.get("matched_entry"))
+    # 2026-10-21 审查修（队列 a3bb97bf）：单条回放同样漏记账 —— 核对与 memory_tool 直写分支
+    #   （_record_memory_meta 内部会 prune 孤儿；remove 走 _prune_orphan_meta）保持一致。
+    if target == "memory" and isinstance(result, dict) and result.get("success"):
+        if action in ("add", "replace", "patch"):
+            _record_memory_meta(payload.get("content") or "")
+        elif action == "remove":
+            _prune_orphan_meta()
+    return result
 
 
 MEMORY_SCHEMA = {
@@ -606,7 +631,9 @@ import time as _cost_time
 import json as _cost_json
 import atexit as _cost_atexit
 
-_COST_LOG = _cost_os.path.expanduser("~/.hermes/logs/memory_cost.jsonl")
+# 2026-10-21 审查修（队列 3aa3d730）：原模块级写死 expanduser("~/.hermes/...")
+#   ⇒ HERMES_HOME/profile 非默认时成本日志写到默认 home（本 profile 漏记 + 跨 profile 混写）。
+_COST_LOG = str(get_hermes_home() / "logs" / "memory_cost.jsonl")
 _cost_data = {}  # session_id → {lean_chars, user_chars, read_count, read_chars, ts}
 
 
@@ -1092,7 +1119,7 @@ def _record_meta_for_operations(target, operations, result) -> None:
         return
     contents = [op.get("content") or op.get("new_text")
                 for op in (operations or [])
-                if isinstance(op, dict) and op.get("action") in ("add", "replace")]
+                if isinstance(op, dict) and op.get("action") in ("add", "replace", "patch")]
     if contents:
         _update_memory_meta_many(contents)
     # 2026-10-17 审查修复：replace/remove 会把旧内容从 MEMORY.md 里拿走，但旧 hash 的

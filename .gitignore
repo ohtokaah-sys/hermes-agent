@@ -325,3 +325,9 @@ native/fts5_cjk/*.so
 /pm/.lock.json.lock
 
 apps/desktop/.dist-build*
+
+# Local patch backups + stray approval-token files (never commit these)
+*.bak.*
+*.bak
+@confirm:*
+

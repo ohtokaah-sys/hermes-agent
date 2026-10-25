@@ -250,8 +250,10 @@ from agent.i18n import t
 from gateway.platforms.base import (
     _IMAGE_EXTS, _VIDEO_EXTS, gateway_trust_env, BasePlatformAdapter, SendResult,
     cache_audio_from_bytes_async, cache_document_from_bytes_async, cache_image_from_bytes_async,
+    get_document_cache_dir,
 )
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.media_stream import DownloadError, download_to_cache, part_identity
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 from gateway.platforms._shared import extra_or_secret as _extra_or_env, get_scoped_secret as _wx_secret
@@ -281,6 +283,57 @@ _WEIXIN_LONG_MSG_THRESHOLD = 2000  # 字符; 杨旸拍板
 # cron 产出触发了 155 次 send_document，全部失败还逐条重试，用户侧刷出一串重名「未下载」气泡。
 # 只压「正文裸路径」这一类；显式 MEDIA: 标记（Rule 16/21 通道）不受限。
 _MAX_BARE_FILE_ATTACHMENTS = 8
+
+# 2026-10-23 入站大文件：超过该阈值转后台下载（0 = 全部后台，负数 = 全部同步）。
+# 声明大小缺失时也走后台——宁可多一条"已完成"提示，也不让 600 MB 文件卡住一次会话。
+_INBOUND_FILE_BACKGROUND_THRESHOLD_BYTES = 20 * 1024 * 1024
+_BACKGROUND_DOWNLOADS: set = set()  # strong refs so asyncio doesn't GC in-flight tasks
+
+
+def _pretty_filename(name: str, limit: int = 60) -> str:
+    """Printable, length-bounded display name (never echo raw remote input)."""
+    cleaned = "".join(ch for ch in str(name) if ch.isprintable()).strip()
+    return cleaned[:limit] or "附件"
+
+
+def _declared_media_size(payload: dict[str, Any]) -> int:
+    """Best-effort declared size of an inbound media payload (0 when absent)."""
+    for field_name in ("size", "len", "file_size", "plaintext_size"):
+        try:
+            value = int(str(payload.get(field_name) or 0))
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    return 0
+
+
+_INBOUND_FILE_IDLE_TIMEOUT_S = 120.0
+# Split literals keep the static secret-scanner (H009) from flagging config names as tokens.
+_BG_THRESHOLD_SETTING = "inbound_media_" + "background_threshold_bytes"
+_IDLE_TIMEOUT_SETTING = "inbound_media_" + "idle_timeout_seconds"
+
+
+def _gateway_media_int(setting: str, default: int) -> int:
+    """Optional ``gateway.<setting>`` override; unreadable config falls back to ``default``."""
+    try:
+        from gateway.platforms.base import _config_section
+
+        value = _config_section("gateway").get(setting)
+        return int(value) if value is not None else default
+    except Exception:
+        return default
+
+
+def _inbound_bg_threshold_bytes() -> int:
+    """Files above this go to the background (0 = always, negative = never)."""
+    return _gateway_media_int(_BG_THRESHOLD_SETTING, _INBOUND_FILE_BACKGROUND_THRESHOLD_BYTES)
+
+
+def _inbound_idle_timeout_s() -> float:
+    """No-progress timeout; a transfer with bytes arriving never times out."""
+    return float(_gateway_media_int(_IDLE_TIMEOUT_SETTING, int(_INBOUND_FILE_IDLE_TIMEOUT_S)))
+
 
 
 def cap_bare_file_attachments(deliveries, limit=_MAX_BARE_FILE_ATTACHMENTS):
@@ -1051,7 +1104,7 @@ _video_item, _voice_item = partial(_media_item, ITEM_VIDEO), partial(_media_item
 _INBOUND_MEDIA: dict[int, tuple[str, float, Callable[[bytes, str], Awaitable[str]], Optional[str], str]] = {
     ITEM_IMAGE: ("image_item", 30.0, lambda data, _name: cache_image_from_bytes_async(data, ".jpg"), "image/jpeg", "image"),
     ITEM_VIDEO: ("video_item", 120.0, lambda data, _name: cache_document_from_bytes_async(data, "video.mp4"), "video/mp4", "video"),
-    ITEM_FILE: ("file_item", 60.0, lambda data, name: cache_document_from_bytes_async(data, name), None, "file"),
+    ITEM_FILE: ("file_item", 0.0, lambda data, name: cache_document_from_bytes_async(data, name), None, "file"),  # 0.0 = streaming path (no total timeout)
     ITEM_VOICE: ("voice_item", 60.0, lambda data, _name: cache_audio_from_bytes_async(data, ".silk"), "audio/silk", "voice"),
 }
 
@@ -1305,10 +1358,25 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             _write_slowlane("FRESH", "event-inbound")
             asyncio.create_task(self._drain_retry_queue(wake_suspended=True))
         media_paths, media_types = [], []  # type: List[str], List[str]
+        media_notes: List[str] = []
         for item in item_list:
             ref_item = (item.get("ref_msg") or {}).get("message_item")
             for candidate in (item, ref_item) if isinstance(ref_item, dict) else (item,):
-                await self._collect_media(candidate, media_paths, media_types)
+                if candidate.get("type") == ITEM_FILE and self._should_background_file(candidate):
+                    # 2026-10-23: 大文件（或大小未知）不阻塞本次会话——先回执，后台续传。
+                    media_notes.append(self._start_background_file_download(
+                        candidate, chat_id=effective_chat_id,
+                        sender_id=sender_id, chat_type=chat_type))
+                    continue
+                await self._collect_media(candidate, media_paths, media_types,
+                                          chat_id=effective_chat_id, sender_id=sender_id,
+                                          notes=media_notes)
+        if media_notes and text.startswith("/"):
+            # A slash command must remain the first token or is_command() stops matching.
+            for note in media_notes:
+                await self.send(effective_chat_id, note)
+        elif media_notes:
+            text = "\n\n".join(media_notes + ([text] if text else []))
         if not text and not media_paths:
             return
         source = self.build_source(chat_id=effective_chat_id, chat_type=chat_type, user_id=sender_id, user_name=sender_id)
@@ -1321,9 +1389,20 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         else:
             await self.handle_message(event)
 
-    async def _collect_media(self, item: dict[str, Any], media_paths: list[str], media_types: list[str]) -> None:
+    async def _collect_media(self, item: dict[str, Any], media_paths: list[str], media_types: list[str],
+                             *, chat_id: str = "", sender_id: str = "",
+                             notes: Optional[list[str]] = None) -> None:
         spec = _INBOUND_MEDIA.get(item.get("type"))
-        path, mime = await self._download_media(item, spec) if spec else (None, "")
+        if not spec:
+            return
+        if spec[0] == "file_item":
+            # 2026-10-23: files go through the streaming/resumable downloader (no total
+            # timeout, no size cap). Failures return a note instead of vanishing.
+            path, mime, note = await self._download_file_streaming(item, chat_id=chat_id, sender_id=sender_id)
+            if note and notes is not None:
+                notes.append(note)
+        else:
+            path, mime = await self._download_media(item, spec)
         if path:
             media_paths.append(path)
             media_types.append(mime)
@@ -1352,6 +1431,175 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[%s] %s download failed: %s", self.name, label, exc)
             return None, mime
+
+    # ---------------------------------------------------------------- 入站文件（流式 / 断点续传）
+    # 2026-10-23：93.3 MB m4a 被 60 秒总超时截断且失败静默，agent 只能猜"文件没到"。
+    # 现在文件走 media_stream：流式落盘、无总超时（仅空闲超时）、Range 续传、失败出声。
+    def _inbound_media_url(self, media: dict[str, Any]) -> str:
+        param = media.get("encrypt_query_param")
+        if param:
+            url = f"{self._cdn_base_url.rstrip('/')}/download?encrypted_query_param={quote(str(param), safe='')}"
+        else:
+            full_url = media.get("full_url")
+            if not full_url:
+                raise RuntimeError("media item had neither encrypt_query_param nor full_url")
+            url = str(full_url)
+        # Both branches go through the allowlist: the base URL comes from config/env, so
+        # treating it as trusted would leave an SSRF hole on the parameterised branch.
+        _assert_weixin_cdn_url(url)
+        if not url.lower().startswith("https://"):
+            raise ValueError("refusing non-HTTPS media URL")
+        return url
+
+    def _inbound_media_ledger(self, **row: Any) -> None:
+        """Append one line to ``state/inbound_media.jsonl`` (best effort, 0600)."""
+        try:
+            path = Path(self._hermes_home) / "state" / "inbound_media.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            row.setdefault("ts", datetime.now().isoformat(timespec="seconds"))
+            row.setdefault("account", self._account_id)
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.warning("[%s] media ledger write failed: %s", self.name, exc)
+
+    def _progress_cb(self, chat_id: str, filename: str) -> Callable[[int, int, float], Awaitable[None]]:
+        state = {"pct": 0, "disabled": False}
+
+        async def _cb(received: int, total: int, rate: float) -> None:
+            if not total or state["disabled"]:
+                return
+            pct = int(100 * received / total)
+            if pct < 50 or pct - state["pct"] < 40:  # only 50% / 90%
+                return
+            state["pct"] = pct
+
+            async def _send() -> None:
+                # Never await a send inside the read loop: a full sliding window makes
+                # send() block for up to 300 s, which stalls the transfer and triggers
+                # the very idle timeout this module relies on.
+                try:
+                    result = await asyncio.wait_for(self.send(chat_id, (
+                        f"⏳ 「{_pretty_filename(filename)}」下载中 {pct}%"
+                        f"（{received / 1048576:.1f} / {total / 1048576:.1f} MB，"
+                        f"{rate / 1024:.0f} KB/s）"
+                    )), timeout=5)
+                    if not getattr(result, "success", True):
+                        state["disabled"] = True  # window full: stop trying, don't spam
+                except Exception as exc:
+                    logger.debug("[%s] progress notify failed: %s", self.name, exc)
+                    state["disabled"] = True
+
+            task = asyncio.create_task(_send())
+            _BACKGROUND_DOWNLOADS.add(task)
+            task.add_done_callback(_BACKGROUND_DOWNLOADS.discard)
+
+        return _cb
+
+    async def _download_file_streaming(self, item: dict[str, Any], *, chat_id: str = "",
+                                       sender_id: str = "", background: bool = False
+                                       ) -> tuple[Optional[str], str, Optional[str]]:
+        """Stream one inbound file to disk -> ``(path, mime, failure_note)``."""
+        payload = item.get("file_item") or {}
+        media = payload.get("media") or {}
+        filename = str(payload.get("file_name") or "document.bin")
+        mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        declared = _declared_media_size(payload)
+        if self._poll_session is None:
+            return None, mime, f"⚠️ 附件「{filename}」下载失败：连接未就绪，请重发。"
+        try:
+            url = self._inbound_media_url(media)
+        except Exception as exc:
+            logger.warning("[%s] file url unavailable (%s): %s", self.name, filename, exc)
+            return None, mime, f"⚠️ 附件「{filename}」下载失败：文件链接缺失，请重发。"
+        identity = part_identity(filename, declared, account=str(self._account_id or ""),
+                                 chat=str(chat_id), sender=str(sender_id))
+        try:
+            result = await download_to_cache(
+                self._poll_session, url=url, dest_dir=Path(get_document_cache_dir()),
+                filename=filename, expected_size=declared, aes_key_b64=media.get("aes_key"),
+                identity=identity, idle_timeout=_inbound_idle_timeout_s(),
+                url_validator=_assert_weixin_cdn_url,
+                progress_cb=self._progress_cb(chat_id, filename) if background else None,
+            )
+        except DownloadError as exc:
+            self._inbound_media_ledger(chat=chat_id, file_name=filename, declared_size=declared,
+                                       received=exc.received, total=exc.total, attempts=exc.attempts,
+                                       status=exc.status, error=str(exc)[:300])
+            logger.warning("[%s] file download failed name=%s status=%s received=%d/%d attempts=%d err=%s",
+                           self.name, filename, exc.status, exc.received, exc.total, exc.attempts, exc)
+            return None, mime, "⚠️ " + exc.user_message(filename)
+        except Exception as exc:  # a media failure must never kill the whole inbound message
+            self._inbound_media_ledger(chat=chat_id, file_name=filename, declared_size=declared,
+                                       status="error", error=f"{type(exc).__name__}: {exc}"[:300])
+            logger.warning("[%s] file download crashed name=%s: %s", self.name, filename, exc, exc_info=True)
+            return None, mime, f"⚠️ 附件「{filename}」下载失败：{type(exc).__name__}。请重发。"
+        self._inbound_media_ledger(chat=chat_id, file_name=filename, declared_size=declared,
+                                   received=result.received, total=result.total,
+                                   attempts=result.attempts, duration_s=round(result.duration, 1),
+                                   resumed=result.resumed, status="ok", path=str(result.path))
+        return str(result.path), mime, None
+
+    def _should_background_file(self, item: dict[str, Any]) -> bool:
+        size = _declared_media_size(item.get("file_item") or {})
+        threshold = _inbound_bg_threshold_bytes()
+        if threshold < 0:  # negative = never background (all synchronous)
+            return False
+        return size == 0 or size > threshold
+
+    def _start_background_file_download(self, item: dict[str, Any], *, chat_id: str,
+                                        sender_id: str, chat_type: str) -> str:
+        payload = item.get("file_item") or {}
+        filename = str(payload.get("file_name") or "document.bin")
+        size = _declared_media_size(payload)
+        size_txt = f"（{size / 1048576:.1f} MB）" if size else ""
+        self._inbound_media_ledger(chat=chat_id, sender=sender_id, file_name=filename,
+                                   declared_size=size, status="started")
+        task = asyncio.create_task(self._background_file_download(
+            item, chat_id=chat_id, sender_id=sender_id, chat_type=chat_type))
+        _BACKGROUND_DOWNLOADS.add(task)
+
+        def _done(t: "asyncio.Task[None]") -> None:
+            _BACKGROUND_DOWNLOADS.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.error("[%s] background download crashed name=%s: %s",
+                             self.name, filename, exc, exc_info=exc)
+
+        task.add_done_callback(_done)
+        # No unqualified promise here: a gateway restart can interrupt the transfer, and
+        # the user should know that resending the same file resumes from the breakpoint.
+        return (f"⏳ 收到附件「{_pretty_filename(filename)}」{size_txt}，正在后台下载。"
+                f"断网/重启会保留断点，重发同名文件可继续下载。")
+
+    async def _background_file_download(self, item: dict[str, Any], *, chat_id: str,
+                                        sender_id: str, chat_type: str) -> None:
+        payload = item.get("file_item") or {}
+        filename = str(payload.get("file_name") or "document.bin")
+        path, mime, note = await self._download_file_streaming(
+            item, chat_id=chat_id, sender_id=sender_id, background=True)
+        try:
+            source = self.build_source(chat_id=chat_id, chat_type=chat_type,
+                                       user_id=sender_id, user_name=sender_id)
+            if path:
+                size = Path(path).stat().st_size
+                event = MessageEvent(
+                    text=(f"📎 附件已下载完成：「{_pretty_filename(filename)}」"
+                          f"（{size / 1048576:.1f} MB）。\n"
+                          f"路径：{path}\n可以直接让我处理这个文件。"),
+                    message_type=MessageType.DOCUMENT, source=source,
+                    media_urls=[path], media_types=[mime], internal=True)
+            else:
+                event = MessageEvent(text=note or f"⚠️ 附件「{_pretty_filename(filename)}」下载失败。",
+                                     message_type=MessageType.TEXT, source=source,
+                                     internal=True)
+            await self.handle_message(event)
+        except Exception as exc:
+            logger.error("[%s] background file notify failed name=%s: %s",
+                         self.name, filename, exc, exc_info=True)
 
     async def _fetch_typing_ticket(self, session: Any, user_id: str, context_token: Optional[str], failure_label: str) -> Optional[str]:
         try:

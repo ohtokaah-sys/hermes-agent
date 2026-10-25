@@ -33,7 +33,14 @@ INCIDENT_STATES = ("detected", "alerted", "resolved", "closed")
 _FAILURE_TYPE_ORDER = (
     ("rate_limit", (r"\b429\b", "rate limit", "usage limit", "quota")),
     ("timeout", ("timeout", "timed out")),
-    ("auth", (r"\b401\b", "unauthorized", "authentication", "auth")),
+    # 2026-10-25 修（杨旸裁定）：原 `"auth"` 是**裸子串** —— 任意 stdout/stderr 里出现
+    #   author / oauth / authz 都会被判成凭据失败（实测：脚本 exit 1 + 输出含 "author"
+    #   被标 auth）。改为带边界的短语，并保留 401 / unauthorized 两个高置信信号。
+    #   注意匹配器规则：首尾都是 \b 才走正则，否则按子串匹配。
+    ("auth", (r"\b401\b", r"\bunauthorized\b",
+              r"\bauthentication (?:failed|required|error)\b",
+              r"\bauth (?:failed|required|denied)\b",
+              r"\binvalid[ _-]?(?:api[ _-]?key|token|credentials?)\b")),
     ("delivery", ("delivery", "deliver", "delivering")),
     ("config", ("config", "configuration", "validation")),
     ("script", ("script", "no_agent")),

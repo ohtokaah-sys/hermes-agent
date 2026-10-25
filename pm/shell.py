@@ -33,30 +33,43 @@ from pm import paths
 from pm.lock import Facts
 
 
-def _staged_bash() -> str | None:
-    """The git Package's bash.exe under the store (Windows bundles only)."""
+def _staged_bash_candidates() -> list[str]:
+    """Every existing staged bash.exe under the git Package (Windows bundles only).
+
+    2026-10-21 审查修（队列 bec9be46）：原实现只返回**第一个存在的**候选
+    （usr/bin 优先于 bin）。若它存在却启动不了（半装的包 / 被杀软拦），
+    第二条可用候选永远不会被尝试 ⇒ bash() 退化成「没有 bash」。
+    2026-10-21 审查修（队列 62b9ee66）：docstring 不再点名具体厂商（中性描述）。
+    """
     import platform
 
     if platform.system() != "Windows":
-        return None
+        return []
     facts_path = paths.facts_path()
     if not facts_path.is_file():
-        return None
+        return []
+    out: list[str] = []
     try:
         facts = Facts(facts_path)
         fact = facts.get("git")
         if fact is None or "entry" not in fact:
-            return None
+            return []
         entry = paths.store_root() / fact["entry"]
         for candidate in (
             entry / "usr" / "bin" / "bash.exe",
             entry / "bin" / "bash.exe",
         ):
             if candidate.is_file():
-                return str(candidate)
+                out.append(str(candidate))
     except Exception:
-        return None
-    return None
+        return []
+    return out
+
+
+def _staged_bash() -> str | None:
+    """The git Package's bash.exe under the store (Windows bundles only)."""
+    candidates = _staged_bash_candidates()
+    return candidates[0] if candidates else None
 
 
 # PATH dirs whose bash.exe is not a shell: System32 holds the WSL launcher
@@ -73,9 +86,10 @@ def windows_bash_candidates(on_path: str | None, env: Mapping[str, str],
     precedes Git on most PATHs (#116818).
 
     ``extra_roots`` carries Git roots the env ladder cannot see (see
-    :func:`git_install_roots`): vendor installers such as Huawei AppGallery put
-    Git under ``D:\\AppGallery\\Git`` and only add ``cmd\\`` to PATH, so both
-    the Program Files ladder and ``which bash`` miss it.
+    :func:`git_install_roots`): some vendor installers put Git under a
+    store-specific directory (e.g. ``D:\\<vendor-store>\\Git``) and only add
+    ``cmd\\`` to PATH, so both the Program Files ladder and ``which bash``
+    miss it. (2026-10-21 审查修 队列 62b9ee66：原来是具名厂商，改中性描述。)
     """
     programfiles = env.get("ProgramFiles", r"C:\Program Files")
     candidates = []
@@ -98,31 +112,42 @@ def windows_bash_candidates(on_path: str | None, env: Mapping[str, str],
     return list(dict.fromkeys(candidates))
 
 
+def _registry_git_roots() -> list[str]:
+    """``Software\\GitForWindows`` ``InstallPath`` (HKLM, then HKCU). Windows only.
+
+    2026-10-21 审查修（队列 4c1207c8）：抽成独立函数，测试可 monkeypatch 掉
+    ——否则在装了 Git for Windows 的 Windows 上跑单测会读到真实注册表，
+    ``git_install_roots`` 多返回一项，精确断言必然失败。
+    """
+    if os.name != "nt":  # pragma: no cover - Windows-only registry read
+        return []
+    roots: list[str] = []
+    try:
+        import winreg
+    except ImportError:
+        return []
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            with winreg.OpenKey(hive, r"SOFTWARE\GitForWindows") as key:
+                value, _ = winreg.QueryValueEx(key, "InstallPath")
+        except OSError:
+            continue
+        if isinstance(value, str) and value.strip():
+            roots.append(value.strip())
+    return roots
+
+
 def git_install_roots(env: Mapping[str, str], git_path: str | None = None) -> list[str]:
     """Git for Windows install roots that no environment variable names.
 
     Two sources:
 
-    * ``Software\\GitForWindows`` ``InstallPath`` (HKLM, then HKCU) — what Git's
+    * ``Software\\\\GitForWindows`` ``InstallPath`` (HKLM, then HKCU) — what Git's
       own installer records, wherever the user installed it;
     * the root implied by ``git`` on PATH — vendor installers still expose
-      ``cmd\\git.exe``, so ``<root>\\bin\\bash.exe`` sits one level over.
+      ``cmd\\\\git.exe``, so ``<root>\\\\bin\\\\bash.exe`` sits one level over.
     """
-    roots: list[str] = []
-    if os.name == "nt":  # pragma: no cover - Windows-only registry read
-        try:
-            import winreg
-        except ImportError:
-            winreg = None  # type: ignore[assignment]
-        if winreg is not None:
-            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-                try:
-                    with winreg.OpenKey(hive, r"SOFTWARE\GitForWindows") as key:
-                        value, _ = winreg.QueryValueEx(key, "InstallPath")
-                except OSError:
-                    continue
-                if isinstance(value, str) and value.strip():
-                    roots.append(value.strip())
+    roots: list[str] = _registry_git_roots()
     resolved = git_path if git_path is not None else shutil.which("git")
     if resolved:
         parent = ntpath.dirname(resolved)
@@ -146,9 +171,10 @@ def _bash_starts(candidate: str) -> bool:
 
 def bash() -> str | None:
     """Resolve the bash binary to use, or None if none is available."""
-    staged = _staged_bash()
-    if staged and _bash_starts(staged):
-        return staged
+    # 2026-10-21 审查修（队列 bec9be46）：逐个试 staged 候选，别只赌第一个存在的那个。
+    for staged in _staged_bash_candidates():
+        if _bash_starts(staged):
+            return staged
 
     on_path = shutil.which("bash")
     if os.name == "nt":
