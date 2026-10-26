@@ -675,6 +675,7 @@ def _project_for_display(messages: list, *, home=None, inline_images: bool = Tru
     from agent.context_compressor import is_compaction_summary_message
     from agent.conversation_compression import _extract_steer_text_from_message
     from agent.history_commentary import project_history_commentary
+    from agent.gateway_notices import is_internal_notice as _is_gateway_internal_notice
     from agent.prompt_builder import STEER_DISPLAY_KIND
     from agent.turn_failure_copy import untyped_failed_turn_display_kind
 
@@ -700,6 +701,10 @@ def _project_for_display(messages: list, *, home=None, inline_images: bool = Tru
             message.get("role"), message.get("content"))
         if failed_turn:
             message = {**message, "display_kind": failed_turn}
+        if (message.get("role") == "user" and not message.get("display_kind")
+                and _is_gateway_internal_notice(message.get("content"))
+                and not str(message.get("content") or "").lstrip().startswith("[System:")):
+            continue
         if _is_untyped_scaffold_notice(message):
             projected = message.copy()
             projected["display_kind"] = "hidden"
