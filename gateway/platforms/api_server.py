@@ -3020,6 +3020,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @staticmethod
     def _message_response(message: dict[str, Any]) -> dict[str, Any]:
         message = _project_client_message(message)
+        if message.get("role") == "user":
+            from agent.gateway_origin import strip as _strip_origin_envelope
+            own_text = _strip_origin_envelope(message.get("content"))
+            if own_text:
+                message = {**message, "content": own_text}
         safe_keys = (
             "id", "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
             "timestamp", "token_count", "finish_reason", "reasoning", "reasoning_content",
