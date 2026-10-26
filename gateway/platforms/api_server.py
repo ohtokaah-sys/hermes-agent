@@ -3738,9 +3738,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 name, payload = item
                 await response.write(_sse_frame(payload, event=name, ensure_ascii=False))
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            await self._drain_session_stream_task_on_disconnect(
-                run_id, task, interrupt_message="SSE client disconnected", shield_wait=False)
-            logger.info("Session SSE client disconnected; interrupted live run %s", run_id)
+            if self._detach_on_disconnect(request):
+                # Web client navigated away / mobile suspended: keep the turn running; the
+                # reply is persisted and the transcript is reloaded when the client returns.
+                logger.info("Session SSE client disconnected; run continues %s", run_id)
+            else:
+                await self._drain_session_stream_task_on_disconnect(
+                    run_id, task, interrupt_message="SSE client disconnected", shield_wait=False)
+                logger.info("Session SSE client disconnected; interrupted live run %s", run_id)
         except asyncio.CancelledError:
             await self._drain_session_stream_task_on_disconnect(
                 run_id, task, interrupt_message="SSE task cancelled", shield_wait=True)
@@ -3761,6 +3766,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
             events.enqueue("approval.request", event)  # executor thread -> loop hop inside
         return _approval_notify
+
+    @staticmethod
+    def _detach_on_disconnect(request: web.Request) -> bool:
+        """Web clients opt into a detached run: navigating away must not cancel the turn."""
+        return (request.headers.get("X-Hermes-Detach-On-Disconnect") or "").strip().lower() in {
+            "1", "true", "yes"}
 
     async def _drain_session_stream_task_on_disconnect(
         self, run_id: str, task: asyncio.Task, *, interrupt_message: str, shield_wait: bool
