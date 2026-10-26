@@ -3299,6 +3299,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         messages = await asyncio.to_thread(
             db.get_messages, resolved_id, limit=limit, offset=offset, latest=latest_page,
             include_compacted=include_compacted, include_ancestors=True)
+        from agent.gateway_notices import is_internal_notice
+        messages = [
+            m for m in messages
+            if not (m.get("role") == "user" and is_internal_notice(m.get("content")))
+        ]
         return web.json_response({
             "object": "list", "session_id": resolved_id,
             "data": [self._message_response(m) for m in messages],

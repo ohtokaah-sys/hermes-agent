@@ -649,7 +649,8 @@ def _is_untyped_scaffold_notice(message) -> bool:
     if not isinstance(message, dict) or message.get("role") != "user" or message.get("display_kind"):
         return False
     content = message.get("content")
-    return isinstance(content, str) and content.lstrip().startswith("[System:")
+    from agent.gateway_notices import is_internal_notice
+    return is_internal_notice(content)
 
 
 def _strip_gateway_origin_envelope(content) -> str | None:
