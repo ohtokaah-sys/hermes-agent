@@ -675,19 +675,32 @@ def _write_cache_file(cache_dir: Path, prefix: str, ext: str, data: bytes) -> st
     return str(filepath)
 
 
-def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
+def _media_cache_subdir(base: Path, profile: Any = None) -> Path:
+    """按 profile 分目录（2026-10-28：图片/语音/视频缓存原本四档共用一个大筐）。
+
+    与 cache_document_from_bytes 的 profile 参数同一口径：不传 profile 保持旧行为
+    （直接写 base 目录），传了才落到 base/<profile>/。
+    """
+    if not profile:
+        return base
+    d = Path(base) / str(profile)
+    _secure_media_cache_dir(d)
+    return d
+
+
+def cache_image_from_bytes(data: bytes, ext: str = ".jpg", profile: Any = None) -> str:
     """Save raw image bytes to the cache and return the absolute path; raises
     ValueError when *data* isn't an image (e.g. an upstream HTML error page)."""
     validate_inbound_media_size(len(data), media_type="image")
     if not _looks_like_image(data):
         snippet = data[:80].decode("utf-8", errors="replace")
         raise ValueError(f"Refusing to cache non-image data as {ext} (starts with: {snippet!r})")
-    return _write_cache_file(get_image_cache_dir(), "img", ext, data)
+    return _write_cache_file(_media_cache_subdir(get_image_cache_dir(), profile), "img", ext, data)
 
 
-async def cache_image_from_bytes_async(data: bytes, ext: str = ".jpg") -> str:
+async def cache_image_from_bytes_async(data: bytes, ext: str = ".jpg", profile: Any = None) -> str:
     """Cache image bytes without blocking the caller's event loop."""
-    return await asyncio.to_thread(cache_image_from_bytes, data, ext)
+    return await asyncio.to_thread(cache_image_from_bytes, data, ext, profile)
 
 
 async def _cache_media_from_url(url: str, ext: str, retries: int, *, media_type: str, accept: str,
@@ -728,10 +741,11 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
 
 
 def _cleanup_cache_dir(cache_dir: Path, max_age_hours: int) -> int:
-    """Delete files in *cache_dir* older than *max_age_hours*; return the count removed."""
+    """Delete files in *cache_dir* (including profile subdirs) older than *max_age_hours*."""
     cutoff = time.time() - (max_age_hours * 3600)
     removed = 0
-    for f in cache_dir.iterdir():
+    # rglob：2026-10-28 起媒体缓存按 profile 分子目录，只扫顶层会永远清不到子目录。
+    for f in cache_dir.rglob("*"):
         if f.is_file() and f.stat().st_mtime < cutoff:
             with contextlib.suppress(OSError):
                 f.unlink()
@@ -745,17 +759,18 @@ get_audio_cache_dir, cleanup_audio_cache = _cache_dir_accessors(
     "audio", "AUDIO_CACHE_DIR", "cache/audio", "audio_cache")
 
 
-def cache_audio_from_bytes(data: bytes, ext: str = ".ogg") -> str:
+def cache_audio_from_bytes(data: bytes, ext: str = ".ogg", profile: Any = None) -> str:
     """Save raw audio bytes to the cache (container-sniffed ext); return the path."""
     # tools.audio_container is the ONE owner of container detection (outbound TTS repair + here).
     from tools.audio_container import sniff_audio_ext
     validate_inbound_media_size(len(data), media_type="audio")
-    return _write_cache_file(get_audio_cache_dir(), "audio", sniff_audio_ext(data, ext), data)
+    return _write_cache_file(_media_cache_subdir(get_audio_cache_dir(), profile), "audio",
+                             sniff_audio_ext(data, ext), data)
 
 
-async def cache_audio_from_bytes_async(data: bytes, ext: str = ".ogg") -> str:
+async def cache_audio_from_bytes_async(data: bytes, ext: str = ".ogg", profile: Any = None) -> str:
     """Cache audio bytes without blocking the caller's event loop."""
-    return await asyncio.to_thread(cache_audio_from_bytes, data, ext)
+    return await asyncio.to_thread(cache_audio_from_bytes, data, ext, profile)
 
 
 async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) -> str:
@@ -775,15 +790,15 @@ SUPPORTED_VIDEO_TYPES = {
     ".mkv": "video/x-matroska", ".avi": "video/x-msvideo"}
 
 
-def cache_video_from_bytes(data: bytes, ext: str = ".mp4") -> str:
+def cache_video_from_bytes(data: bytes, ext: str = ".mp4", profile: Any = None) -> str:
     """Save raw video bytes to the cache and return the absolute file path."""
     validate_inbound_media_size(len(data), media_type="video")
-    return _write_cache_file(get_video_cache_dir(), "video", ext, data)
+    return _write_cache_file(_media_cache_subdir(get_video_cache_dir(), profile), "video", ext, data)
 
 
-async def cache_video_from_bytes_async(data: bytes, ext: str = ".mp4") -> str:
+async def cache_video_from_bytes_async(data: bytes, ext: str = ".mp4", profile: Any = None) -> str:
     """Cache video bytes without blocking the caller's event loop."""
-    return await asyncio.to_thread(cache_video_from_bytes, data, ext)
+    return await asyncio.to_thread(cache_video_from_bytes, data, ext, profile)
 
 
 # Document / screenshot cache utilities (same pattern; referenced by local path).

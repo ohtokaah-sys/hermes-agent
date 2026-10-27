@@ -1554,9 +1554,15 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             data = await _download_and_decrypt_media(
                 self._poll_session, cdn_base_url=self._cdn_base_url, encrypted_query_param=media.get("encrypt_query_param"),
                 aes_key_b64=aes_key_b64, full_url=media.get("full_url"), timeout_seconds=timeout_seconds)
+            prof = str(getattr(self, "_owner_profile", None) or "default")
             if item_key == "file_item":
-                prof = str(getattr(self, "_owner_profile", None) or "default")
                 return await cache_document_from_bytes_async(data, filename, profile=prof), mime
+            # 2026-10-28：图片/语音也按档落盘 —— 之前四档共用一个 cache 大筐，
+            # 与文档串档是同一类问题（没有归属就谈不上按档可见性）。
+            if item_key == "image_item":
+                return await cache_image_from_bytes_async(data, ".jpg", profile=prof), mime
+            if item_key == "voice_item":
+                return await cache_audio_from_bytes_async(data, ".silk", profile=prof), mime
             return await cache_fn(data, filename), mime
         except Exception as exc:
             logger.warning("[%s] %s download failed: %s", self.name, label, exc)
