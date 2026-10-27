@@ -1523,11 +1523,14 @@ def _strip_media_tag_directives(text: str) -> str:
     return _delete_spans(cleaned, _deliverable_tag_spans(cleaned))
 
 
-def cache_document_from_bytes(data: bytes, filename: str) -> str:
+def cache_document_from_bytes(data: bytes, filename: str, profile: str | None = None) -> str:
     """Save raw document bytes to the cache as ``doc_{uuid12}_{original_name}`` and return
     the absolute path; raises ValueError if the sanitized path escapes the cache directory."""
     cache_dir = get_document_cache_dir()
-    # Sanitize: strip directory components, null bytes, and control characters
+    if profile:
+        cache_dir = cache_dir / str(profile)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    # Sanitize: strip directory components, null bytes and control characters
     safe_name = (Path(filename).name if filename else "document").replace("\x00", "").strip()
     if not safe_name or safe_name in {".", ".."}:
         safe_name = "document"
@@ -1539,9 +1542,9 @@ def cache_document_from_bytes(data: bytes, filename: str) -> str:
     return str(filepath)
 
 
-async def cache_document_from_bytes_async(data: bytes, filename: str) -> str:
+async def cache_document_from_bytes_async(data: bytes, filename: str, profile: str | None = None) -> str:
     """Cache document bytes without blocking the caller's event loop."""
-    return await asyncio.to_thread(cache_document_from_bytes, data, filename)
+    return await asyncio.to_thread(cache_document_from_bytes, data, filename, profile)
 
 
 # Unified media caching: classify attachment bytes by ext/MIME, route to cache_*_from_bytes.

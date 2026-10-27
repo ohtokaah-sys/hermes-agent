@@ -1,6 +1,29 @@
 """Weixin (WeChat personal account) adapter over Tencent's iLink Bot API. Long-poll ``getupdates`` drives inbound
 delivery; every outbound reply must echo the peer's latest ``context_token``; media moves through an AES-128-ECB
-encrypted CDN; ``qr_login`` backs the gateway setup wizard."""
+encrypted CDN; ``qr_login`` backs the gateway setup wizard.
+
+出站平台约束（2026-10-26 写死，**不是 bug，不要「修好主动发送」**）
+---------------------------------------------------------------
+iLink 在用户再次给 bot 发消息之前，不会 prepare bot 主动发起的消息。窗口外的发送一律返回
+``ret=-2 / errmsg=prepare failed``，去 context_token 重发也一样 —— 这就是
+``_session_not_ready_error`` 的确定性结论，不是限流、不该重试风暴。
+
+因此策略是「**不丢 · 不空转 · 下次入站按原序一次补投并标注延迟**」：
+
+* 分两个桶落盘（2026-10-26，owner口径「宁可半年后一次补一本小说，也不接受任何一条回复丢失」）：
+  ``state/weixin_retry_response.jsonl``（**对话回复：无上限、无 TTL、不裁剪、不进死信**，
+  >500 条或 >10MB 只告警）与 ``state/weixin_retry.jsonl``（cron：100 条 / 7 天，溢出转死信）；
+  解析失败的行搬 ``<桶>.corrupt``，不删；写盘一律 tmp+``os.replace`` 原子写。
+* ``source=response``（对话回复）与 ``source=cron`` 同样 3 次上限后转 ``suspended``；
+* ``suspended`` 的 30 分钟兜底**只对 cron 生效**，response 只等入站唤醒（不空转）；
+* 入站触发 ``_drain_retry_queue(wake_suspended=True)``：按 ``first_ts`` 顺序补投，
+  延迟 >5 分钟加 ``[延迟送达 · 原发送 HH:MM]``，多条时首条加汇总行；
+* ``response`` 不进 24h 死信（对话断链），长期 suspended 保留等入站；
+* cron 条目 24h 无唤醒 → ``state/weixin_retry_dead.jsonl``（归档不删，可用
+  ``~/.hermes/scripts/weixin-retry-flush.py`` 人工重投）。
+
+可观测指标（日志可数）：``retry_enqueued`` / ``delivered_late`` / ``retry_dead`` / ``retry suspended``。
+"""
 
 from __future__ import annotations
 
@@ -96,7 +119,7 @@ def _update_last_send_ts() -> None:
 
 _RETRY_QUEUE_MAX = 100
 
-_RETRY_TTL_SECONDS = 7 * 24 * 3600
+_RETRY_TTL_SECONDS = 7 * 24 * 3600   # 只作用于 cron 桶；response 桶无 TTL
 
 _RETRY_MAX_ATTEMPTS = 3           # A方案: attempts>3 转挂起（不再占用慢速窗口）
 
@@ -104,7 +127,83 @@ _RETRY_SUSPEND_TTL = 24 * 3600    # A方案: 挂起 24h 仍无唤醒信号 → �
 
 _RETRY_SUSPEND_FALLBACK = 30 * 60 # A方案: 挂起 30min 兜底唤醒试一次
 
+_RETRY_DRAIN_GAP_SECONDS = 1.5    # 补投条目之间的间隔（避免批量补投撞 iLink 节流）
+
+# ── 2026-10-26 分桶（owner口径：宁可半年后一次补一本小说，也不接受任何一条回复丢失）──
+# response 桶：无上限、无 TTL、不裁剪、不进死信、损坏行只隔离不删 —— 只允许"保留中"。
+# cron 桶：沿用旧队列（100 条上限 / 7 天 TTL），超限只丢最旧 cron，且先写死信留全文。
 _retry_path = str(Path(get_hermes_home()) / "state" / "weixin_retry.jsonl")
+_retry_response_path = str(Path(get_hermes_home()) / "state" / "weixin_retry_response.jsonl")
+_RETRY_RESPONSE_WARN_COUNT = 500
+_RETRY_RESPONSE_WARN_BYTES = 10 * 1024 * 1024
+
+
+def _bucket_path(source: str) -> str:
+    """response → 无上限桶；其余（cron/未知来源）→ 有上限桶。
+
+    分桶的理由不是整洁，是**丢失面**：旧实现用 ``lines[-100:]`` 读队列，
+    任何超过 100 条的积压都会被静默截断 —— response 与 cron 混在一个文件里时，
+    被截掉的可能是对话回复。分开之后 cron 仍可被限制，response 永不裁。
+    """
+    return _retry_response_path if source == "response" else _retry_path
+
+
+def _quarantine_corrupt(path: str, raw_line: str) -> None:
+    """解析失败的行搬进 ``<path>.corrupt``，**不删**（口径：只允许"保留中"）。"""
+    try:
+        with open(path + ".corrupt", "a", encoding="utf-8") as f:
+            f.write(raw_line.rstrip("\n") + "\n")
+    except OSError as exc:
+        logger.warning("[Weixin] corrupt 行隔离失败（原行仍在原文件）：%s", exc)
+
+
+def _load_bucket(path: str) -> List[Dict[str, Any]]:
+    """读一个桶。坏行移 ``.corrupt`` 后跳过，其余照常返回。文件不存在 = 空桶。"""
+    if not Path(path).exists():
+        return []
+    items: List[Dict[str, Any]] = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except Exception:
+                _quarantine_corrupt(path, line)
+                continue
+            if not isinstance(item, dict):
+                _quarantine_corrupt(path, line)
+                continue
+            items.append(item)
+    return items
+
+
+def _save_bucket(path: str, items: List[Dict[str, Any]]) -> None:
+    """原子写：tmp + ``os.replace``。半写不会把整个队列吃掉。"""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for item in items:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    os.replace(tmp, p)
+
+
+def _response_bucket_size(path: str) -> int:
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return 0
+
+
+def _warn_if_response_bucket_big(path: str, count: int) -> None:
+    """response 桶超阈值**只告警不删**（口径写死，别加清理）。"""
+    size = _response_bucket_size(path)
+    if count > _RETRY_RESPONSE_WARN_COUNT:
+        logger.warning("[Weixin] response 补投桶 %d 条（>%d）—— 只告警不删，等下次入站补投",
+                       count, _RETRY_RESPONSE_WARN_COUNT)
+    if size > _RETRY_RESPONSE_WARN_BYTES:
+        logger.warning("[Weixin] response 补投桶 %d 字节（>10MB）—— 只告警不删，等下次入站补投", size)
 
 class _DeferredToRetryQueue(Exception):
     """发送本轮失败，但消息已安全落入补投队列（drain 会补发）——**推迟，不是失败**。
@@ -114,42 +213,42 @@ class _DeferredToRetryQueue(Exception):
     与非本异常的其它 ``Exception`` 必须区别对待：真失败仍走原路（记 delivery_failed）。
     """
 
-def _retry_enqueue(to: str, text: str, source: str = "cron") -> bool:
+def _retry_enqueue(to: str, text: str, source: str = "cron", *, first_ts: Optional[float] = None) -> bool:
     """入补投队列（幂等: 同 id 已存在则 attempts+1，不新增行）。失败静默。
 
     A方案 (2026-08-21): source 区分对话回复(response)与 cron 推送。
-    - 对话回复（response）豁免硬上限：不转挂起（最高价值消息，须必达）。
-    - cron 推送：attempts > _RETRY_MAX_ATTEMPTS → 转挂起（status=suspended，
-      不再占用慢速窗口，等唤醒信号或 30min 兜底，24h 归档，不丢内容）。
 
-    返回（2026-09-15 新增）：``True`` = 本条以 **active** 落盘（drain 会补发，属"必达的推迟"）；
-    ``False`` = 入队失败，或本条被转为 **suspended**（有 24h 转死信的风险，**不**视为必达）。
-    调用方据此区分「推迟」与「失败」——收紧判定，避免把可能永不送达的消息记成 ok。
+    2026-10-26 修订（owner授权，决策 1+3）：
+    · **response 不再豁免尝试上限** —— iLink 在用户再次入站前不会 prepare bot 主动发送，
+      豁免上限只会让对话回复永远占着 active 位、每次入站被无意义重试。现在两者同样
+      3 次上限后转 ``suspended``，只等入站唤醒。
+    · 但 response **不进 24h 死信**（cron 可以）：对话回复进死信 = 对话断链。
+      用 ``no_dead_letter`` 标记，由 :meth:`_drain_retry_queue` 识别并长期保留。
+
+    返回 True = 本条以 active 落盘（drain 会补发，属"必达的推迟"）；
+    False = 入队失败，或本条已转 suspended（不视为必达）。
     """
     try:
-        # 幂等去重 key（非安全边界）: sha1 截断 16 hex 用于队列内去重；队列上限 100 条，
+        # 幂等去重 key（非安全边界）: sha1 截断 16 hex 用于桶内去重；
         # 64-bit 碰撞概率 ~1e-12 可忽略。review 曾误标为 SHA-1 安全缺陷——此为去重非加密用途。
         mid = hashlib.sha1(f"{to}|{text}".encode()).hexdigest()[:16]
-        lines: List[str] = []
-        if Path(_retry_path).exists():
-            with open(_retry_path) as _f:
-                lines = [_l for _l in _f if _l.strip()]
+        path = _bucket_path(source)
+        is_response = path == _retry_response_path
+        items = _load_bucket(path)
         now = time.time()
         found = False
         out: List[Dict[str, Any]] = []
-        for line in lines[-_RETRY_QUEUE_MAX:]:
-            try:
-                item = json.loads(line)
-            except Exception:
+        for item in items:
+            # TTL 只清 cron 桶；response 桶无 TTL（半年后也要能补投）
+            if not is_response and now - float(item.get("ts", 0)) > _RETRY_TTL_SECONDS:
                 continue
-            if now - float(item.get("ts", 0)) > _RETRY_TTL_SECONDS:
-                continue  # TTL 过期丢弃（休假积压不迟到多日）
             if item.get("id") == mid:
                 item["attempts"] = int(item.get("attempts", 1)) + 1
+                item.setdefault("first_ts", item.get("ts", now))  # 首次时间：延迟标注按它算
                 item["ts"] = now
                 item["source"] = source
-                # A方案: cron 且 attempts 超上限 → 转挂起（不占窗口）；response 豁免
-                if source != "response" and int(item.get("attempts", 1)) > _RETRY_MAX_ATTEMPTS:
+                # 2026-10-26: response 也纳入上限（原为 source != "response" 才挂起）
+                if int(item.get("attempts", 1)) > _RETRY_MAX_ATTEMPTS:
                     item["status"] = "suspended"
                     item["suspended_since"] = item.get("suspended_since") or now
                 else:
@@ -159,13 +258,26 @@ def _retry_enqueue(to: str, text: str, source: str = "cron") -> bool:
             out.append(item)
         if not found:
             # 2026-08-21: 存完整 text（原 text[:500] 截断——drain 重发时发截断版，
-            # 导致「前面一样后面少了」。补投的目的是消息必达，截断违背目的。
-            # 队列上限 _RETRY_QUEUE_MAX=100，存完整文本仍可控。）
-            out.append({"id": mid, "ts": now, "to": to, "text": text,
-                        "attempts": 1, "source": source, "status": "active"})
-        with open(_retry_path, "w") as _f:
-            for item in out:
-                _f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            # 导致「前面一样后面少了」。补投的目的是消息必达，截断违背目的。）
+            entry: Dict[str, Any] = {"id": mid, "ts": now, "first_ts": first_ts or now,
+                                     "to": to, "text": text, "attempts": 1,
+                                     "source": source, "status": "active"}
+            if is_response:
+                entry["no_dead_letter"] = True
+            out.append(entry)
+        # cron 桶才有上限：超限只丢最旧 cron，且先写死信留全文（不是静默截断）
+        if not is_response and len(out) > _RETRY_QUEUE_MAX:
+            out.sort(key=lambda i: float(i.get("ts") or 0))
+            overflow = out[: len(out) - _RETRY_QUEUE_MAX]
+            out = out[len(out) - _RETRY_QUEUE_MAX:]
+            for dropped in overflow:
+                dropped["reason"] = "cron-overflow-dropped"
+                _retry_dead_letter(dropped)
+            logger.warning("[Weixin] cron 补投桶超上限，最旧 %d 条转死信（dropped_cron=%d，全文已归档）",
+                           len(overflow), len(overflow))
+        _save_bucket(path, out)
+        if is_response:
+            _warn_if_response_bucket_big(path, len(out))
         # 2026-09-15: 仅当本条以 active 落盘才算「必达的推迟」；转 suspended 有 24h 转死信的风险，
         # **不**视为必达（收紧判定，避免把可能永不送达的消息记成 ok）。
         _entry = next((_i for _i in out if _i.get("id") == mid), None)
@@ -181,30 +293,30 @@ def _retry_remove(to: str, text: str) -> None:
     后队列残留同 hash 条目 → token 恢复 drain 时**再发一次** → 同一内容重复投递
     （实证：education 内容 806ae9eb 当晚 22:40 + 23:26 被发两次）。
     出队去重：发送成功即清掉同 (to|text) 条目，与入队幂等互补。
+
+    ⚠️ 2026-10-26：hash 由 ``to|text`` 算出，所以**补投时若改写了正文（延迟标注），
+    这里就删不掉原条目** —— 补投路径必须改用 :func:`_retry_remove_by_id`。
     """
     try:
         mid = hashlib.sha1(f"{to}|{text}".encode()).hexdigest()[:16]
-        if not Path(_retry_path).exists():
-            return
-        with open(_retry_path) as _f:
-            lines = [_l for _l in _f if _l.strip()]
-        kept = []
-        removed = 0
-        for line in lines:
-            try:
-                item = json.loads(line)
-            except Exception:
-                kept.append(line)
-                continue
-            if item.get("id") == mid:
-                removed += 1
-            else:
-                kept.append(line)
-        if removed:
-            with open(_retry_path, "w") as _f:
-                _f.writelines(kept)
+        _retry_remove_by_id(mid)
     except Exception as exc:
         logger.warning("[Weixin] retry_remove failed: %s", exc)
+
+def _retry_remove_by_id(mid: str) -> None:
+    """按 id 出队 —— 两个桶都扫。
+
+    补投路径必须用它：投递时正文加了「延迟送达」标注，hash 已与原条目对不上
+    （见 :func:`_retry_remove`）。分桶后同一条可能落在任一桶里，所以两边都查。
+    """
+    for path in (_retry_response_path, _retry_path):
+        try:
+            items = _load_bucket(path)
+            kept = [i for i in items if i.get("id") != mid]
+            if len(kept) != len(items):
+                _save_bucket(path, kept)
+        except Exception as exc:
+            logger.warning("[Weixin] retry_remove_by_id failed (%s): %s", path, exc)
 
 def _retry_dead_letter(item: Dict[str, Any]) -> None:
     """A方案 (2026-08-21): 挂起 24h 仍无唤醒信号 → 写死信归档（不删内容，可检索可恢复）。
@@ -215,7 +327,8 @@ def _retry_dead_letter(item: Dict[str, Any]) -> None:
     try:
         dead_path = str(Path(get_hermes_home()) / "state" / "weixin_retry_dead.jsonl")
         item["dead_since"] = time.time()
-        item["reason"] = "suspended-24h-no-wake-signal"
+        # 调用方可以给具体原因（如 cron-overflow-dropped）；没给才用默认的挂起超时原因
+        item["reason"] = item.get("reason") or "suspended-24h-no-wake-signal"
         with open(dead_path, "a") as _f:
             _f.write(json.dumps(item, ensure_ascii=False) + "\n")
         logger.warning(
@@ -276,7 +389,7 @@ SESSION_EXPIRED_ERRCODE, RATE_LIMIT_ERRCODE = -14, -2  # -2: iLink frequency lim
 
 # 2026-08-04 投递优化: 长消息阈值——超过则转 MD 文件发送（替代拆 chunk 撞 iLink 限流窗口）。
 # 上游 #184 实证: 同一用户 60s 窗口 >10 条被拒; 合并短块 + 长文转文件从源头减少 sendmessage 调用。
-_WEIXIN_LONG_MSG_THRESHOLD = 2000  # 字符; 杨旸拍板
+_WEIXIN_LONG_MSG_THRESHOLD = 2000  # 字符; owner拍板
 
 # 2026-09-19 发送风暴事故：正文里的**裸本地路径**会被自动当附件投递（base.extract_local_files，
 # 上游 4920c5940f/#1640 有意设计），但原实现对条数**无上限** —— 一条列出 155 条 /tmp 路径的
@@ -469,7 +582,10 @@ def _record_outbound(text: str) -> None:
     try:
         import json as _json
         with open(_outbound_cache_path, 'a') as f:
-            f.write(_json.dumps({"ts": ts, "text": text[:500]}, ensure_ascii=False) + '\n')
+            # 2026-10-27: 原 text[:500] 截断 ⇒ 重启后 _lookup_outbound 只能取回半截正文
+            # （pre_flight_check 判为产出文件截断，FAIL 阻断部署）。持久化存全文；
+            # 文件行数由 _lookup_outbound 的 200 行裁剪兜住，不会无限增长。
+            f.write(_json.dumps({"ts": ts, "text": text}, ensure_ascii=False) + '\n')
     except Exception:
         pass
 
@@ -1117,6 +1233,14 @@ _OUTBOUND_BY_EXT: tuple[tuple[frozenset, str, str], ...] = (
 _DIRECT_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
 
+def _document_cache_subdir(adapter) -> Path:
+    """P1 串档修复：入站文档按所属 profile 分目录（default 也进自己的目录）。"""
+    prof = str(getattr(adapter, "_owner_profile", None) or "default")
+    d = Path(get_document_cache_dir()) / prof
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     ALLOW_ALL_ENV_PREFIX = "WEIXIN"
     supports_code_blocks = True  # Weixin renders fenced code blocks
@@ -1154,6 +1278,9 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._sliding_window_max = max(1, int(_extra_or_secret(extra, "sliding_window_max", "5")))
         self._sliding_window_events: List[float] = []
         self._sliding_gate = asyncio.Lock()
+        # 补投风暴断路：同一会话 60s 内失败 5 次 → 暂停该会话补投 300s。
+        self._retry_chat_failures: dict[str, list[float]] = {}
+        self._retry_chat_paused_until: dict[str, float] = {}
         self._dm_policy = _extra_or_secret(extra, "dm_policy", "pairing").lower()
         self._group_policy = _extra_or_secret(extra, "group_policy", "disabled").lower()
         # ``extra`` wins even when falsy (an explicit empty list disables the env allowlist).
@@ -1427,6 +1554,9 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             data = await _download_and_decrypt_media(
                 self._poll_session, cdn_base_url=self._cdn_base_url, encrypted_query_param=media.get("encrypt_query_param"),
                 aes_key_b64=aes_key_b64, full_url=media.get("full_url"), timeout_seconds=timeout_seconds)
+            if item_key == "file_item":
+                prof = str(getattr(self, "_owner_profile", None) or "default")
+                return await cache_document_from_bytes_async(data, filename, profile=prof), mime
             return await cache_fn(data, filename), mime
         except Exception as exc:
             logger.warning("[%s] %s download failed: %s", self.name, label, exc)
@@ -1517,7 +1647,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                                  chat=str(chat_id), sender=str(sender_id))
         try:
             result = await download_to_cache(
-                self._poll_session, url=url, dest_dir=Path(get_document_cache_dir()),
+                self._poll_session, url=url, dest_dir=_document_cache_subdir(self),
                 filename=filename, expected_size=declared, aes_key_b64=media.get("aes_key"),
                 identity=identity, idle_timeout=_inbound_idle_timeout_s(),
                 url_validator=_assert_weixin_cdn_url,
@@ -1671,7 +1801,8 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._rate_limit_circuit_until = 0.0
 
     async def _send_text_chunk(self, *, chat_id: str, chunk: str, context_token: Optional[str], client_id: str,
-                               source: str = "cron") -> None:
+                               source: str = "cron", in_drain: bool = False,
+                               no_retry: bool = False) -> None:
         """Send one text chunk with retry/backoff under the adapter-wide text gate. A stale-session response (``-14``,
         or ``-2`` with ``prepare failed``/``unknown error``) is re-sent once *without* ``context_token`` — iLink accepts
         tokenless sends as a degraded fallback, which keeps cron pushes working when no user message refreshed the
@@ -1735,67 +1866,290 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     if wait > 0:
                         await asyncio.sleep(wait)
             assert last_error is not None
+            if in_drain or no_retry:
+                # in_drain: 补投路径下**不再入队** —— 队列里已有本条权威条目（原 text/attempts/first_ts），
+                # 而 chunk 此时带延迟标注、hash 与原条目不同，再入队就是第二条 → 重复投递。
+                # no_retry: 控制/收尾消息失败绝不入队，否则会形成「补投完成」自我复制风暴。
+                if no_retry:
+                    logger.warning("[Weixin] control message dropped after send failure (no_retry) to=%s",
+                                   _safe_id(chat_id))
+                raise last_error
             # 2026-08-20: 重试耗尽仍失败 → 送入补投队列（跨进程/跨重启持久化，下次 inbound drain 延迟补发）。
             # 覆盖瞬时限流/会话过期重试无效的长窗口失败（cron 推送数小时后仍补发，消息不丢）。
-            _retry_enqueue(chat_id, chunk, source=source)
+            queued = _retry_enqueue(chat_id, chunk, source=source)
+            logger.warning("[%s] retry_enqueued to=%s source=%s len=%d",
+                           self.name, _safe_id(chat_id), source, len(chunk))
+            if queued:
+                # 消息已安全落队列 ⇒ 这是「必达的推迟」，不是失败。
+                # 原实现继续 raise last_error，cron 层会记 delivery_failed（报警失真）。
+                raise _DeferredToRetryQueue(
+                    f"消息已入补投队列（source={source}），下次入站补发")
             raise last_error
 
     async def _drain_retry_queue(self, wake_suspended: bool = False) -> None:
-        """v3 (2026-08-21, A方案): 冲刷补投队列（fire-and-forget，不阻塞长轮询）。
+        """冲刷补投队列（fire-and-forget，不阻塞长轮询）。
 
-        - 普通条目(status=active): 逐条走 self.send()（自带滑动窗口限速 + 慢速锁读取），成功出队、失败留队再冲。
-        - 挂起条目(status=suspended): 默认跳过不占窗口；唤醒时（入站/token刷新/30min兜底）转 active 重试；
-          挂起超 24h 无唤醒信号 → 写死信归档（全文+原因+时间可恢复，不删内容）。
-        仅在有 live adapter/session 时可用（standalone 场景由下次 inbound 触发）。
+        **平台约束（写死，别当 bug 修）**：iLink 在用户再次入站前不会 prepare bot 主动发送，
+        窗口外的推送必然失败。策略是「不丢、不空转、下次入站按原序一次补投并标注延迟」。
+
+        2026-10-26 修订（owner授权，决策 1+3）：
+        · response 与 cron 同样 3 次上限后转 suspended（原 response 豁免 ⇒ 永远占 active 位空转）
+        · suspended 的 30min 兜底**只对 cron 生效**：response 只等入站唤醒
+        · response 不进 24h 死信（对话回复进死信 = 对话断链），长期 suspended 保留等入站
+        · 补投按 ts 顺序；每条延迟 >5min 在批次 md 内标注原发送时间
+        · 出队按 **id**（聚合正文不再依赖内容 hash）
+        · 每个会话只发一个聚合 markdown，批次之间才 sleep，避免补投风暴
         """
+        DELAY_ANNOTATE_SECONDS = 300   # 超过 5 分钟才计入迟到
+        DRAIN_GAP_SECONDS = _RETRY_DRAIN_GAP_SECONDS   # 模块级，便于测试置零
+        MAX_PER_DRAIN = 50            # 单轮最多取 50 条；剩下的留在桶里，下次入站接着补（断点续投）
+        if getattr(self, "_draining", False):
+            # 并发保护（2026-10-27）：每条入站都会 create_task(drain)，而队列是
+            # read-modify-write ⇒ 两个 drain 并发会把同一条投两遍。
+            # 但**入站唤醒不能吞**：suspended 条目只等入站唤醒，吞掉就等于「用户说话了
+            # 也补不出来」，要等下一次入站（可能几小时/几天）。所以记账，由在跑那一轮
+            # 收尾时立刻补跑一轮。
+            if wake_suspended:
+                self._drain_wake_pending = True
+                logger.info("[%s] retry drain 已在进行；本次入站唤醒已记账，本轮结束后立即补跑",
+                            self.name)
+            else:
+                logger.info("[%s] retry drain 已在进行，跳过本轮（防重复投递）", self.name)
+            return
+        self._draining = True
+        self._drain_wake_pending = False
+        loaded_stats: Dict[str, Optional[Tuple[int, int]]] = {}
         try:
-            if not Path(_retry_path).exists():
-                return
-            with open(_retry_path) as _f:
-                lines = [_l for _l in _f if _l.strip()]
-            if not lines:
-                return
-            remaining: List[str] = []
             now = time.time()
-            for line in lines:
+            raw: List[Dict[str, Any]] = []
+            # response 桶先补（对话回复优先），再补 cron 桶；每条记住自己属于哪个桶
+            # （dict.fromkeys 去重：测试里两个桶可能指向同一文件，重复读会重复补投）
+            for _bp in dict.fromkeys((_retry_response_path, _retry_path)):
+                # 外部清空/改写的保护基线：drain 是 read-modify-write，若期间用户/脚本
+                # 删掉队列，不能把内存里的旧条目重新写回去（resurrect）。
                 try:
-                    item = json.loads(line)
-                except Exception:
-                    continue
+                    _st = os.stat(_bp)
+                    loaded_stats[_bp] = (_st.st_mtime_ns, _st.st_size)
+                except OSError:
+                    loaded_stats[_bp] = None
+                for _item in _load_bucket(_bp):
+                    _item["_bucket"] = _bp
+                    raw.append(_item)
+            if not raw:
+                return
+            pending: List[Dict[str, Any]] = []
+            keep: List[Dict[str, Any]] = []
+            paused_skipped = 0
+            for item in raw:
                 if not item.get("to") or not item.get("text"):
+                    logger.warning("[%s] retry 条目缺 to/text，移入 .corrupt 保留（不删）id=%s",
+                                   self.name, item.get("id"))
+                    _quarantine_corrupt(str(item.get("_bucket") or _retry_path),
+                                        json.dumps(item, ensure_ascii=False))
                     continue
-                # A方案: 挂起条目处理
+                to = str(item["to"])
+                paused_until = float(self._retry_chat_paused_until.get(to, 0.0) or 0.0)
+                if paused_until > now:
+                    # 风暴断路器：暂停期内只保留，不发送、不计失败。
+                    keep.append(item)
+                    paused_skipped += 1
+                    continue
+                if paused_until:
+                    self._retry_chat_paused_until.pop(to, None)
+                source = str(item.get("source", "cron"))
                 if item.get("status") == "suspended":
                     suspended_since = float(item.get("suspended_since") or item.get("ts") or now)
-                    # 24h 无信号 → 死信归档（含全文+原因+时间，可恢复）
                     if now - suspended_since > _RETRY_SUSPEND_TTL:
-                        _retry_dead_letter(item)
-                        continue  # 归档后出队（下一轮不再留）
-                    # 未到 30min 兜底时限且未唤醒 → 跳过不占窗口
-                    if not wake_suspended and (now - suspended_since) < _RETRY_SUSPEND_FALLBACK:
-                        remaining.append(line)
+                        if not item.get("no_dead_letter"):
+                            _retry_dead_letter(item)
+                            logger.warning("[%s] retry_dead id=%s attempts=%s "
+                                           "reason=suspended-24h-no-wake",
+                                           self.name, item.get("id"), item.get("attempts"))
+                            continue
+                        # 对话回复不进死信。但也**不能只保留不投递**：原实现超 TTL 后
+                        # 无条件 keep+continue ⇒ 入站唤醒也叫不醒，条目永久占桶却永不送达
+                        # （2026-10-27 审查 D0.4 修）。非入站 drain 仍只保留（不空转），
+                        # 入站唤醒则重新激活并本轮重投。
+                        if not wake_suspended:
+                            logger.warning("[%s] retry item suspended >24h but kept "
+                                           "(no_dead_letter) id=%s", self.name, item.get("id"))
+                            keep.append(item)
+                            continue
+                        item["status"] = "active"
+                        item["attempts"] = 0
+                        item.pop("suspended_since", None)
+                        logger.warning("[%s] retry item suspended >24h reactivated by inbound wake "
+                                       "(no_dead_letter) id=%s", self.name, item.get("id"))
+                    fallback_due = (now - suspended_since) >= _RETRY_SUSPEND_FALLBACK
+                    # response：只等入站；cron：保留 30min 兜底（原行为）
+                    if not wake_suspended and (source == "response" or not fallback_due):
+                        keep.append(item)
                         continue
-                    # 唤醒/兜底到 → 转 active 参与本轮重发
-                    item["status"] = "active"
-                    item["suspended_since"] = None
+                pending.append(item)
+            if paused_skipped:
+                logger.warning("[Weixin] retry drain skipped %d items due to chat pause", paused_skipped)
+
+            # 桶优先于时间：response 桶整段先补（按 first_ts 升序），cron 桶随后
+            pending.sort(key=lambda i: (0 if i.get("_bucket") == _retry_response_path else 1,
+                                        float(i.get("first_ts") or i.get("ts") or 0)))
+            if len(pending) > MAX_PER_DRAIN:
+                # 超出部分本轮不动：留在各自的桶里，下次入站继续（这就是断点续投）
+                keep.extend(pending[MAX_PER_DRAIN:])
+                pending = pending[:MAX_PER_DRAIN]
+
+            # 按接收人分组：每个会话一个聚合 markdown；组顺序取排序后的首次出现顺序。
+            groups: Dict[str, List[Dict[str, Any]]] = {}
+            for item in pending:
+                groups.setdefault(str(item["to"]), []).append(item)
+
+            delivered_late = 0
+            failed = 0
+            total = len(pending)
+            stats_by_to: Dict[str, Dict[str, int]] = {}
+            successful_ids: List[str] = []
+            for group_idx, (to, group) in enumerate(groups.items()):
+                n = len(group)
+                source = str(group[0].get("source", "cron"))
+                first_ts_values = [float(i.get("first_ts") or i.get("ts") or now) for i in group]
+                earliest_ts, latest_ts = min(first_ts_values), max(first_ts_values)
+                md_lines = [
+                    f"# 微信补投（{n} 条）",
+                    ("> 最早原发送 "
+                     f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(earliest_ts))}；"
+                     f"最近 {time.strftime('%H:%M', time.localtime(latest_ts))}；以下按原顺序"),
+                    "",
+                ]
+                for item_idx, item in enumerate(group, 1):
+                    item_ts = float(item.get("first_ts") or item.get("ts") or now)
+                    delay_minutes = max(0, int((now - item_ts) // 60))
+                    md_lines.append(
+                        f"## {item_idx}. 原发送 "
+                        f"{time.strftime('%H:%M:%S', time.localtime(item_ts))}"
+                        f"（延迟 {delay_minutes} 分钟）")
+                    md_lines.append(str(item["text"]))
+                    md_lines.append("")
+                md_text = "\n".join(md_lines)
+
+                batch_error: Optional[Exception] = None
                 try:
-                    source = item.get("source", "cron")
-                    result = await self.send(str(item["to"]), str(item["text"]),
-                                             metadata={"source": source})
+                    result = await self.send(
+                        to, md_text, metadata={"source": source, "_in_drain": True})
                     if result.success:
-                        logger.info("[%s] retry queue drained: %s (attempts=%d, source=%s)",
-                                    self.name, _safe_id(str(item["to"])), item.get("attempts", 1), source)
-                        continue  # 成功 → 出队
+                        late_count = sum(
+                            1 for item in group
+                            if now - float(item.get("first_ts") or item.get("ts") or now)
+                            > DELAY_ANNOTATE_SECONDS)
+                        delivered_late += late_count
+                        if late_count:
+                            stats_by_to.setdefault(to, {"late": 0, "fail": 0})["late"] += late_count
+                        # 延后到本轮统一落盘之后按 id 出队：否则 _retry_remove_by_id 的
+                        # 自身写盘会改变 mtime，让同桶失败条目的 attempts 更新被外部
+                        # 修改保护误判而跳过。发送成功的事实已在内存里，绝不丢失。
+                        successful_ids.extend(str(item.get("id") or "") for item in group)
+                        logger.info("[%s] retry batch delivered to=%s n=%d",
+                                    self.name, _safe_id(to), n)
+                    else:
+                        batch_error = RuntimeError(result.error or "send returned success=False")
                 except Exception as exc:
-                    logger.warning("[%s] retry drain failed for %s: %s",
-                                   self.name, _safe_id(str(item.get("to", ""))), exc)
-                remaining.append(json.dumps(item, ensure_ascii=False))  # 失败留队（写回更新后的 item，持久化 status 变化）
-            with open(_retry_path, "w") as _f:
-                _f.writelines(remaining)
-        except Exception:
-            pass
+                    batch_error = exc
 
+                if batch_error is not None:
+                    # 整批失败：每个条目只计一次尝试；超上限按原策略转 suspended。
+                    failure_now = time.time()
+                    failed += n
+                    stats_by_to.setdefault(to, {"late": 0, "fail": 0})["fail"] += n
+                    for item in group:
+                        item["attempts"] = int(item.get("attempts", 1)) + 1
+                        item["ts"] = failure_now
+                        if item["attempts"] > _RETRY_MAX_ATTEMPTS:
+                            item["status"] = "suspended"
+                            item["suspended_since"] = failure_now
+                            logger.warning("[%s] retry suspended after %d attempts id=%s source=%s",
+                                           self.name, item["attempts"], item.get("id"),
+                                           item.get("source", "cron"))
+                        else:
+                            item["status"] = "active"
+                        keep.append(item)
+                    logger.warning("[%s] retry batch failed to=%s n=%d: %s",
+                                   self.name, _safe_id(to), n, batch_error)
+                    # 风暴断路器：同会话 60s 内失败 5 次 → 暂停 300s。
+                    fail_times = self._retry_chat_failures.setdefault(to, [])
+                    fail_times.append(failure_now)
+                    fail_times[:] = [t for t in fail_times if failure_now - t <= 60]
+                    if len(fail_times) >= 5:
+                        self._retry_chat_paused_until[to] = failure_now + 300
+                        logger.warning(
+                            "[Weixin] retry drain paused for chat %s 300s after 5 failures/60s",
+                            _safe_id(to))
 
+                # 只在聊天组之间 sleep；同组已聚合成一次 send。
+                if group_idx < len(groups) - 1 and DRAIN_GAP_SECONDS > 0:
+                    await asyncio.sleep(DRAIN_GAP_SECONDS)
+
+            by_bucket: Dict[str, List[Dict[str, Any]]] = {_retry_response_path: [], _retry_path: []}
+            for item in keep:
+                bp = str(item.pop("_bucket", _retry_path))
+                by_bucket.setdefault(bp, []).append(item)
+            for bp, bucket_items in by_bucket.items():
+                # 外部清空保护：文件被截空或 mtime 变化时，跳过落盘，避免把
+                # 内存快照里的条目重新复活。
+                loaded_stat = loaded_stats.get(bp)
+                try:
+                    current_stat = os.stat(bp)
+                except OSError:
+                    current_stat = None
+                if not bucket_items and (current_stat is None or current_stat.st_size == 0):
+                    # 成功条目已按 id 出队/外部已清空；无保留条目时写空桶没有意义。
+                    continue
+                if current_stat is not None and current_stat.st_size == 0:
+                    logger.warning(
+                        "[Weixin] bucket modified externally; skip save to avoid resurrecting entries: %s",
+                        bp)
+                    continue
+                if loaded_stat is None and current_stat is None:
+                    continue
+                if (loaded_stat is None or current_stat is None
+                        or current_stat.st_mtime_ns != loaded_stat[0]):
+                    logger.warning(
+                        "[Weixin] bucket modified externally; skip save to avoid resurrecting entries: %s",
+                        bp)
+                    continue
+                _save_bucket(bp, bucket_items)
+                if bp == _retry_response_path:
+                    _warn_if_response_bucket_big(bp, len(bucket_items))
+            # 成功条目统一出队（按 id）；此时失败条目已按最新 attempts/status 落盘。
+            for mid in successful_ids:
+                _retry_remove_by_id(mid)
+            if total:
+                logger.info("[%s] retry queue drained: delivered_late=%d failed=%d remaining=%d",
+                            self.name, delivered_late, failed, len(keep))
+            for _to, _st in stats_by_to.items():
+                if not (_st["late"] or _st["fail"]):
+                    continue
+                # 每个接收人只看到自己的补投结果；控制消息失败绝不能再次入队。
+                try:
+                    await self.send(
+                        _to,
+                        f"[补投完成 · 迟到送达 {_st['late']} 条，"
+                        f"失败 {_st['fail']} 条（已保留，等下次入站）]",
+                        metadata={"source": "response", "_no_retry": True},
+                    )
+                except Exception as exc:
+                    logger.warning("[%s] 补投收尾行发送失败（to=%s）：%s",
+                                   self.name, _safe_id(_to), exc)
+        except Exception as exc:
+            # 不静默：drain 坏了本身就是投递故障，必须留痕（原实现是 pass）
+            logger.warning("[%s] retry drain aborted: %s", self.name, exc)
+        finally:
+            self._draining = False
+            # 在跑期间收到过入站唤醒 ⇒ 立刻补跑一轮（不阻塞本条调用方）
+            if getattr(self, "_drain_wake_pending", False):
+                self._drain_wake_pending = False
+                try:
+                    asyncio.create_task(self._drain_retry_queue(wake_suspended=True))
+                    logger.info("[%s] 补跑一轮 retry drain（此前入站唤醒被并发闸门挡住）", self.name)
+                except RuntimeError as exc:
+                    logger.warning("[%s] 补跑 drain 排不进去（事件循环关闭？）：%s", self.name, exc)
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         if not self._send_session or not self._token:
@@ -1810,10 +2164,13 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             )
         context_token = self._token_store.get(self._account_id, chat_id)
         last_message_id: Optional[str] = None
-        # 2026-09-09 (finding 4): 区分 source——对话回复=response（A方案豁免硬上限不挂起），
-        # cron 推送=metadata.source="cron"（attempts>3 转挂起）。此前 send() 未传 source 致
-        # 全部默认 cron，A方案「response 豁免」失效。
+        # 2026-09-09 (finding 4): 区分 source——对话回复=response，cron 推送=metadata.source="cron"。
+        # 2026-10-26 修订（owner授权）: response 不再豁免尝试上限（见 _retry_enqueue）；
+        #   补投路径额外带 _in_drain（失败不重复入队）与 _retry_prefix（延迟标注）。
         source = (metadata or {}).get("source", "response")
+        in_drain = bool((metadata or {}).get("_in_drain"))
+        no_retry = bool((metadata or {}).get("_no_retry"))
+        retry_prefix = str((metadata or {}).get("_retry_prefix") or "")
         # Extract MEDIA: tags and bare local file paths before text delivery, under the routed
         # profile's scope: Docker MEDIA translation infers the sandbox from the active profile (#109024).
         with self._media_delivery_scope(self.build_source(chat_id=chat_id)):
@@ -1829,6 +2186,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                              + f"\n\n⚠️ 正文中另有 {_dropped_bare} 个本地文件未随本条投递"
                                f"（单条裸路径自动投递上限 {_MAX_BARE_FILE_ATTACHMENTS} 个；"
                                f"如确需发送请显式写 MEDIA: 标记）")
+        media_failed = 0
         try:
             for path, is_voice, label in deliveries:
                 ext = Path(path).suffix.lower()
@@ -1836,6 +2194,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 try:
                     await getattr(self, sender)(chat_id=chat_id, metadata=metadata, **{key: path})
                 except Exception as exc:
+                    media_failed += 1
                     logger.warning("[%s] media delivery failed for %s: %s", self.name, path, exc)
 
             # Deliver text content.
@@ -1843,6 +2202,10 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             # 上游 #184: 同一用户 60s 窗口 >10 条被 iLink 拒绝 → 减少 sendmessage 调用次数从源头降限流命中。
             # 合并规则: 连续短块(单块<500字符)以空行分隔合并; 累计≥2000字符 → 转 MD 文件发送。
             final_content = final_content.strip()
+            if retry_prefix and final_content:
+                # 2026-10-26: 补投延迟标注放在正文最前 —— 长消息会转 MD，标注进文件也看得见；
+                # 且它只存在于投递时的 content，队列里的 text 保持原样（hash/去重不被破坏）。
+                final_content = retry_prefix.rstrip("\n") + "\n\n" + final_content
             if final_content:
                 if len(final_content) > _WEIXIN_LONG_MSG_THRESHOLD:
                     # 长消息 → MD 文件（替代拆 chunk 撞窗口）
@@ -1883,16 +2246,52 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
                     for idx, chunk in enumerate(chunks):
                         client_id = f"hermes-weixin-{uuid.uuid4().hex}"
-                        await self._send_text_chunk(
-                            chat_id=chat_id,
-                            chunk=chunk,
-                            context_token=context_token,
-                            client_id=client_id,
-                            source=source,
-                        )
+                        chunk_kwargs: Dict[str, Any] = {
+                            "chat_id": chat_id,
+                            "chunk": chunk,
+                            "context_token": context_token,
+                            "client_id": client_id,
+                            "source": source,
+                        }
+                        # 只在补投路径才传 in_drain —— 既有调用方/夹具的 _send_text_chunk
+                        # 签名里没有这个参数，无谓地把它们全打断。
+                        if in_drain:
+                            chunk_kwargs["in_drain"] = True
+                        if no_retry:
+                            chunk_kwargs["no_retry"] = True
+                        try:
+                            await self._send_text_chunk(**chunk_kwargs)
+                        except Exception:
+                            # 零丢失（2026-10-27 插队修）：多 chunk 消息在第 k 条失败时，
+                            # 原实现直接抛出 ⇒ 第 k+1..n 条**从未发送也从未入队**，尾部静默丢失。
+                            # 这里把「本条 + 剩余」按原顺序全部入补投队列（同 hash 幂等，
+                            # 已入队的那条不会重复），再向上抛。
+                            # in_drain 时不入队：队列里已有该条的权威全文（再入就是第二条）。
+                            # no_retry 时也不入队：控制/收尾消息失败必须丢弃，不能自我复制。
+                            if not in_drain and not no_retry:
+                                _missed = 0
+                                for _rest in chunks[idx:]:
+                                    if not _retry_enqueue(chat_id, _rest, source=source):
+                                        _missed += 1
+                                if _missed:
+                                    logger.error(
+                                        "[%s] chunk 入队失败 %d 条（需人工追）to=%s",
+                                        self.name, _missed, _safe_id(chat_id))
+                                else:
+                                    logger.warning(
+                                        "[%s] chunk %d/%d 失败：本条及剩余 %d 条已入补投队列",
+                                        self.name, idx + 1, len(chunks), len(chunks) - idx)
+                            raise
                         last_message_id = client_id
                         if idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:
                             await asyncio.sleep(self._send_chunk_delay_seconds)
+            if deliveries and media_failed == len(deliveries) and not final_content:
+                # 纯附件消息且附件全失败 ⇒ 不能报成功（原实现只 warning，
+                # 上层以为送达、用户什么都没收到 —— 2026-10-27 审查修）。
+                return SendResult(
+                    success=False,
+                    error=f"全部附件投递失败（{media_failed}/{len(deliveries)}）",
+                )
             return SendResult(success=True, message_id=last_message_id)
         except _DeferredToRetryQueue as exc:
             # 2026-09-15: **推迟不是失败** —— 消息已安全入补投队列，drain 会补发。
