@@ -27,6 +27,8 @@ Design under test:
   user_id would create an orphan session no reply ever resolves to.
 """
 
+import os
+
 import pytest
 
 from cron.scheduler import _deliver_result, _resolve_delivery_targets
@@ -159,6 +161,13 @@ class TestFallbackMirrorEndToEnd:
             "platforms:\n  slack:\n    enabled: true\n    token: xoxb-test\n"
         )
         monkeypatch.setenv("HERMES_HOME", str(home))
+
+        # 开发机环境里常驻平台目标（WEIXIN_CHAT_ID 等），deliver="all" 会把它们算进
+        # 投递目标，于是这条用例在开发机上因「缺 token」假红，CI 上却是绿的。
+        # 用例只关心 slack，先把其他平台的环境目标清掉。
+        for _key in list(os.environ):
+            if _key.startswith("WEIXIN_") or (_key.endswith("_CHAT_ID") and not _key.startswith("SLACK_")):
+                monkeypatch.delenv(_key, raising=False)
 
         send_calls = []
 
