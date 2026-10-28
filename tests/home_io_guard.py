@@ -62,6 +62,11 @@ class HomeIOGuard:
         self.checking.active = True
         try:
             candidate = os.fsdecode(value)
+            # A bare command name ("python3.14", "bash") is an executable lookup, not a
+            # state read: it resolves against cwd/PATH or a dir_fd, and this checkout
+            # happens to live inside the home. Checked before dir_fd is joined in.
+            if os.sep not in candidate and not os.path.isabs(candidate):
+                return
             if candidate.startswith("~"):
                 # A test may have patched Path.expanduser to fail; the guard must not
                 # turn that into its own crash — the unexpanded path is checked instead.
@@ -82,6 +87,11 @@ class HomeIOGuard:
                 return
             resolved = self._refuse_installed_app_change(value, absolute) if destructive else None
             roots = tuple(_normcase(os.fspath(r)) for r in self.roots())
+            # A bare command name ("python3.14", "bash") is an executable lookup, not a
+            # state read: it resolves against cwd/PATH and this checkout happens to live
+            # inside the home. Anything with a separator stays guarded.
+            if os.sep not in candidate and not os.path.isabs(candidate):
+                return
             # Install detection, not state: pm.environments._payload_manifest reads
             # <home>/manifest.json to decide whether this tree is a sealed payload, and
             # this checkout lives inside the home, so importing the package probes it.
