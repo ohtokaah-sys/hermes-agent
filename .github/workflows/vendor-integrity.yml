@@ -1,0 +1,36 @@
+name: vendor-integrity
+
+on:
+  push:
+    paths: ["vendor/**", "pyproject.toml", "uv.lock", "tools/verify_vendor_wheels.py",
+            ".github/workflows/vendor-integrity.yml"]
+  pull_request:
+    paths: ["vendor/**", "pyproject.toml", "uv.lock", "tools/verify_vendor_wheels.py",
+            ".github/workflows/vendor-integrity.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # 钉 commit SHA
+        with:
+          fetch-depth: 0
+      - name: 运行时自检（脚本仅用标准库，需 Python ≥ 3.11 才有 tomllib）
+        run: |
+          set -euo pipefail
+          python3 -c "import sys; assert sys.version_info >= (3,11), sys.version"
+          python3 -c "import tomllib, hashlib; print('stdlib ok')"
+      - name: 用 base 分支的校验器跑（PR 无法把本次门禁改弱）
+        run: |
+          set -euo pipefail
+          if [ -n "${GITHUB_BASE_REF:-}" ]; then
+            git fetch --no-tags --depth=1 origin "$GITHUB_BASE_REF"
+            git show "FETCH_HEAD:tools/verify_vendor_wheels.py" > /tmp/verifier.py
+          else
+            cp tools/verify_vendor_wheels.py /tmp/verifier.py
+          fi
+          python3 /tmp/verifier.py --repo .
