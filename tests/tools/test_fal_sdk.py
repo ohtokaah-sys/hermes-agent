@@ -2,7 +2,6 @@
 import json
 from types import SimpleNamespace
 
-import fal_client
 import httpx
 import pytest
 
@@ -10,6 +9,10 @@ from tools.fal_common import (
     _ManagedFalSyncClient, _extract_http_status, _managed_fal_billing_error,
     _normalize_fal_queue_url_format, import_fal_client,
 )
+
+# Optional SDK: without it the whole module fails to collect, which reads as a repo
+# error instead of "this box has no FAL adapter installed".
+fal_client = pytest.importorskip("fal_client")
 
 
 @pytest.fixture
