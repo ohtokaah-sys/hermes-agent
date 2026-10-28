@@ -15,7 +15,7 @@ REPO = __file__.rsplit("/tests/", 1)[0]
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
-from agent import context_compressor as cc  # noqa: E402
+from agent import context_compressor as cc
 
 BUDGET = int(8000 * cc._CAP_CHARS_PER_TOKEN)  # 13,600
 
@@ -39,7 +39,7 @@ def _guard_corpus():
     return (
         "## 当前任务\n处理上下文成本战役补丁落地。\n"
         "## 关键台账\n"
-        "- 路径 /home/ohtok/kaah/分析/上下文成本战役_20260913.md\n"
+        "- 路径 /path/to/analysis/上下文成本战役_20260913.md\n"
         "- 决策：甲方案 mg8000 保留率 0.91，封顶 13,600 字符\n"
         "- 文件 ADR_20260914_摘要机械封顶_甲方案.md 已接受\n"
         "- 编号 4ad4bef0222d2013 五轮折叠基线\n"
