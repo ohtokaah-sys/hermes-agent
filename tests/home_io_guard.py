@@ -89,6 +89,16 @@ class HomeIOGuard:
             if (not destructive and os.path.basename(absolute) == "manifest.json"
                     and os.path.dirname(absolute) in roots):
                 return
+            # Same class, one level down: the PM layer also reads
+            # <root>/installs/<hash>/facts.json to describe the selected environment.
+            # Install metadata again, not user state; writes stay refused.
+            # Installation surface, not user state: the PM layer resolves installs/ and
+            # tools/ from the install root (not HERMES_HOME), so subprocess setup probes
+            # them on every spawn even when the test home is isolated. Reads only.
+            if not destructive and any(
+                    _within(absolute, os.path.join(root, sub))
+                    for root in roots for sub in ("installs", "tools")):
+                return
             # Resolving the root itself (get_default_hermes_root's relative_to
             # probe) reads no state; only its contents are guarded.
             if metadata and absolute in roots:
