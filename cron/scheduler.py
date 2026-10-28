@@ -529,6 +529,66 @@ SILENT_MARKER = "[SILENT]"
 # report that merely quotes the token cannot turn a healthy run into a failed one.
 CRON_FAILURE_MARKER = "[CRON_FAILURE]"
 
+# ── Post-hook: advisory output validation ──
+# Ported 2026-10-28 from the fork patch of 2026-07-09 (047dcadf00), adapted to the
+# current scheduler. Advisory by design: a missing script, an unknown type, a non-zero
+# exit or a timeout is logged and never blocks delivery — delivery and the
+# cron_complete booking are separate concerns and stay untouched here.
+# Returns an explicit status rather than a bool so "could not run" never reads as "passed".
+HOOK_TYPE_SCRIPT_MAP = {
+    "always_pass": "_always_pass.sh",
+    "file_check": "_check_file.sh",
+    "content_check": "_check_output.sh",
+    "exit_check": "_check_output_keywords.sh",
+    "state_check": "_check_state.sh",
+}
+
+POST_HOOK_TIMEOUT_SECONDS = 30
+
+
+def _execute_post_hook(job: dict, output_file: Path) -> str:
+    """Run the job's configured post-hook against its saved output file.
+
+    Returns "skipped" (not configured), "passed", "failed" (hook ran and said no),
+    or "unavailable" (script missing, unknown type, could not be launched).
+    Callers treat everything except "failed" as advisory silence.
+    """
+    hook_cfg = job.get("post_hook")
+    if not hook_cfg:
+        return "skipped"
+    hook_type = (hook_cfg.get("type") if isinstance(hook_cfg, dict) else hook_cfg) or ""
+    hook_type = str(hook_type)
+    script_name = HOOK_TYPE_SCRIPT_MAP.get(hook_type)
+    if not script_name:
+        logger.warning("Job '%s': unknown post_hook type %r — skipping", job.get("id"), hook_type)
+        return "unavailable"
+    script_path = Path(get_hermes_home()) / "hooks" / script_name
+    if not script_path.exists():
+        logger.warning("Job '%s': post_hook script not found: %s — skipping", job.get("id"), script_path)
+        return "unavailable"
+    try:
+        result = subprocess.run(
+            [str(script_path), str(output_file), str(job.get("id"))],
+            capture_output=True, text=True, timeout=POST_HOOK_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("Job '%s': post_hook %r timed out after %ss",
+                     job.get("id"), hook_type, POST_HOOK_TIMEOUT_SECONDS)
+        return "failed"
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        logger.error("Job '%s': post_hook %r could not run: %s", job.get("id"), hook_type, exc)
+        return "unavailable"
+    if result.returncode != 0:
+        logger.error(
+            "Job '%s': post_hook %r failed (exit %d): %s",
+            job.get("id"), hook_type, result.returncode,
+            (result.stderr or result.stdout).strip()[:200],
+        )
+        return "failed"
+    logger.debug("Job '%s': post_hook %r passed", job.get("id"), hook_type)
+    return "passed"
+
 
 def _cron_failure_marker_error(text: str) -> Optional[str]:
     """Return failure evidence when an agent response declares a cron failure.
@@ -3073,6 +3133,15 @@ def _save_compose_deliver(
             "Interrupted by gateway shutdown before the run finished "
             "(tool subprocess was killed mid-flight)."
         )
+
+    # Advisory post-hook: validate the saved output. Never blocks delivery and never
+    # touches the cron_complete booking (that accounting is verified separately).
+    if d.success and output_file is not None:
+        _hook_status = _execute_post_hook(job, output_file)
+        if _hook_status == "failed":
+            logger.warning(
+                "Job '%s': post_hook reported a problem — output kept, delivery unaffected",
+                job.get("id"))
 
     (
         deliver_content, d.blocked_config, _silent_alert, d.incident_acked, d.failure_incident_id,

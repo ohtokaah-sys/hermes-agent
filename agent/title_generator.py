@@ -132,6 +132,9 @@ _CONTROL_WRAPPERS = tuple(
 
 # Hermes' own machine-authored openers: a compaction handoff or resumed session must not be titled after them.
 _MACHINE_PREFIXES = (
+    # 2026-10-28: compaction handoff opens with a backtick-wrapped head now
+    # (agent.context_compressor.SUMMARY_PREFIX); keep both forms.
+    "`HISTORICAL SUMMARY",
     "[CONTEXT COMPACTION", LEGACY_SUMMARY_PREFIX, "[Runtime note:", "[System note:", "[SYSTEM]",
     # tui_gateway.server._MODEL_SWITCH_MARKER_PREFIX (keep in sync); persisted as role="user" because
     # strict providers reject a non-first system message.
