@@ -1566,8 +1566,14 @@ def _live_send_text(
     #   "That is a deferral, not a failure: report success so the job is not recorded
     #    ``delivery_failed`` for a message the drain will still send."
     # 仍记 WARNING 保可观测性（不静音）。
-    if not send_success and getattr(send_result, "deferred", False):
-        _deferred_err = getattr(send_result, "error", None) or "deferred to retry queue"
+    # 2026-10-28：dict 形状的结果（silence 过滤 / 部分平台返回裸 dict）同样可能带 deferred；
+    #   只看 getattr 会把 dict 的推迟信号读丢。与此同批修：gateway/delivery.py 不再把
+    #   deferred 的 SendResult 抛成 RuntimeError（否则本分支永远收不到它）。
+    _deferred = (send_result.get("deferred") if isinstance(send_result, dict)
+                 else getattr(send_result, "deferred", False))
+    if not send_success and _deferred:
+        _deferred_err = (send_result.get("error") if isinstance(send_result, dict)
+                         else getattr(send_result, "error", None)) or "deferred to retry queue"
         logger.warning(
             "Job '%s': live adapter send to %s deferred to retry queue "
             "(not a failure; the drain will send it): %s",
@@ -1744,7 +1750,7 @@ def _standalone_media_fallback(
     with a busy loop silently lost its file.  The attachment is the part users notice
     missing, so retry it on the lane that does not depend on that loop.
     """
-    result, err = _standalone_send(t, "", media_files)
+    _result, err = _standalone_send(t, "", media_files)
     if err:
         _note_target_error(
             t.job,
@@ -1883,6 +1889,16 @@ def _deliver_standalone(
         delivery_errors.extend(target_errors)
         return
     result, err = _standalone_send(t, content, media_files)
+    if err is None and result and result.get("deferred"):
+        # 2026-10-28：「推迟不是失败」必须覆盖 standalone 这条路。weixin 会话过期时
+        #   standalone 同样把消息落进补投队列（source=response）并回报 deferred；原实现
+        #   只认 error 文本 ⇒ 记终态 failed，且顺带在 cron.delivery_queue 里再入一次队。
+        #   真失败（无 deferred）仍走下面的原路径。
+        logger.warning(
+            "Job '%s': standalone send to %s deferred to retry queue "
+            "(not a failure; the drain will send it): %s",
+            job["id"], t.where, result.get("error") or "deferred")
+        return
     if err is None and result and result.get("error"):
         # Not inside an except block — the error comes from the result dict, no traceback.
         err = f"delivery error: {result['error']} (target {t.where})"

@@ -125,3 +125,80 @@ class TestSendResultInvariant:
 
     def test_deferred_marker_is_exception_subclass(self):
         assert issubclass(wx._DeferredToRetryQueue, Exception)
+
+
+class TestRouterDoesNotConvertDeferredToFailure:
+    """★ 端到端缺口的钉（2026-10-28）：路由层曾把 deferred 抛成异常。
+
+    `gateway/delivery.py::_deliver_to_platform` 原实现对失败结果一律 `raise RuntimeError`：
+    适配器层的 `deferred=True` 标记在传递层被丢掉 ⇒ cron 层只看到异常，记 `delivery_failed`
+    并再走 standalone 二次投递（同一内容进两个补投桶）。实测 2026-10-27 19:00
+    「日常定时推送任务」：消息 20:40 已补投送达，账单仍记失败。
+
+    反向对照在同一文件里：普通失败必须仍抛（否则等于把所有失败静音）。
+    """
+
+    @staticmethod
+    def _router_with(adapter):
+        from gateway.delivery import DeliveryRouter
+
+        class _Cfg:
+            filter_silence_narration = True
+            platforms: dict = {}
+
+            @staticmethod
+            def get_home_channel(_platform):
+                return None
+
+        return DeliveryRouter(_Cfg(), {})  # type: ignore[arg-type]
+
+    @pytest.mark.asyncio
+    async def test_deferred_result_is_returned_not_raised(self):
+        from gateway.delivery import DeliveryTarget, DeliveryTransport
+        from gateway.config import Platform
+
+        class _Deferring:
+            async def send(self, chat_id, content, metadata=None):
+                return SendResult(success=False, deferred=True,
+                                  error="消息已入补投队列（source=cron），下次入站补发")
+
+        router = self._router_with(_Deferring())
+        target = DeliveryTarget(platform=Platform.WEIXIN, chat_id="u1", is_explicit=True)
+        transport = DeliveryTransport(_Deferring(), None, Platform.WEIXIN)
+        result = await router._deliver_to_platform(
+            target, "hello", {"job_id": "test"}, transport=transport)
+        assert isinstance(result, SendResult)
+        assert result.deferred is True
+        assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_plain_failure_still_raises(self):
+        from gateway.delivery import DeliveryTarget, DeliveryTransport
+        from gateway.config import Platform
+
+        class _Failing:
+            async def send(self, chat_id, content, metadata=None):
+                return SendResult(success=False, error="boom")
+
+        router = self._router_with(_Failing())
+        target = DeliveryTarget(platform=Platform.WEIXIN, chat_id="u1", is_explicit=True)
+        transport = DeliveryTransport(_Failing(), None, Platform.WEIXIN)
+        with pytest.raises(RuntimeError):
+            await router._deliver_to_platform(
+                target, "hello", {"job_id": "test"}, transport=transport)
+
+    @pytest.mark.asyncio
+    async def test_dict_deferred_is_returned_not_raised(self):
+        from gateway.delivery import DeliveryTarget, DeliveryTransport
+        from gateway.config import Platform
+
+        class _DictDeferring:
+            async def send(self, chat_id, content, metadata=None):
+                return {"success": False, "deferred": True, "error": "queued"}
+
+        router = self._router_with(_DictDeferring())
+        target = DeliveryTarget(platform=Platform.WEIXIN, chat_id="u1", is_explicit=True)
+        transport = DeliveryTransport(_DictDeferring(), None, Platform.WEIXIN)
+        result = await router._deliver_to_platform(
+            target, "hello", {"job_id": "test"}, transport=transport)
+        assert result.get("deferred") is True

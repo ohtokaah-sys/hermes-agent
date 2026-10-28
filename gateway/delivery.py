@@ -330,5 +330,16 @@ class DeliveryRouter:
             from gateway.platforms.base import BasePlatformAdapter
             if BasePlatformAdapter._is_partial_delivery(result):
                 raise PartialDeliveryError(error, result)
+            # 2026-10-28：**推迟不是失败**。适配器把消息安全落进持久补投队列后返回
+            # ``SendResult(success=False, deferred=True)``（weixin 会话过期时的正常形态）。
+            # 原实现在这里一律 ``raise`` ⇒ deferred 标记在传递层被丢掉，上层只能看到异常：
+            #   · cron 层记 ``delivery_failed``（cron/scheduler_delivery.py 的 deferred 分支成了死代码）
+            #   · 并再走 standalone 二次投递 ⇒ 同一内容进两个补投桶（cron / response）
+            # 实测 2026-10-27 19:00 的日常定时推送任务：消息 20:40 已补投送达，账单却记失败。
+            # 判据：``deferred`` 是「已持久化、等 drain 补发」的确定信号，只有它免 raise；
+            # 其余失败（含 deferred=False 的普通失败）照旧抛出。
+            if (result.get("deferred") if isinstance(result, dict)
+                    else getattr(result, "deferred", False)):
+                return result
             raise RuntimeError(error or f"{target.platform.value} delivery failed")
         return result

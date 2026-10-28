@@ -878,7 +878,7 @@ class TestWeixinVoiceAlwaysDownloaded:
         adapter._poll_session = Mock()
 
         monkeypatch.setattr(weixin, "cache_audio_from_bytes_async",
-                            AsyncMock(side_effect=lambda data, ext: str(tmp_path / f"voice.{ext.lstrip('.')}")))
+                            AsyncMock(side_effect=lambda data, ext, profile=None: str(tmp_path / f"voice.{ext.lstrip('.')}")))
 
         async def _fake_download(session, *, cdn_base_url, encrypted_query_param,
                                  aes_key_b64, full_url, timeout_seconds):
@@ -942,7 +942,7 @@ class TestWeixinVoiceGatewayHandoff:
         adapter._cdn_base_url = "https://example.invalid"
 
         monkeypatch.setattr(weixin, "cache_audio_from_bytes_async",
-                            AsyncMock(side_effect=lambda data, ext: str(tmp_path / f"voice.{ext.lstrip('.')}")))
+                            AsyncMock(side_effect=lambda data, ext, profile=None: str(tmp_path / f"voice.{ext.lstrip('.')}")))
         async def _fake_download(*a, **k):
             return b"\x00\x01FAKE_SILK"
         monkeypatch.setattr(weixin, "_download_and_decrypt_media", _fake_download)
@@ -955,7 +955,13 @@ class TestWeixinVoiceGatewayHandoff:
         adapter.handle_message = _capture
 
         tencent_text = "garbled English phonemes for a Russian voice"
-        await adapter._process_message(self._inbound_voice_message(tencent_text))
+        msg = self._inbound_voice_message(tencent_text)
+        # 2026-10-28：`_guess_chat_type` 判 DM 的判据是 `to_user_id == 本机 bot id`。夹具里
+        #   写死的 "test-account" 与 `adapter._account_id`（iLink bot id）不一致 ⇒ 这条 DM
+        #   被判成 group 消息、又被群白名单拦掉 ⇒ `_process_message` 早退、事件根本不产生
+        #   （红得看不出真因）。这里对齐成真实 bot id，测的才是 voice→STT 那条链。
+        msg["to_user_id"] = adapter._account_id
+        await adapter._process_message(msg)
 
         assert "event" in captured
         event = captured["event"]
@@ -1039,7 +1045,6 @@ class TestWeixinDeliveryOptimization:
         adapter._send_text_chunk = AsyncMock()
 
         # 重定向 MD 目录到 tmp_path
-        md_dir = tmp_path / "投递"
         monkeypatch.setattr(weixin, "_WEIXIN_MD_DIR", "投递")
         monkeypatch.setattr(weixin.Path, "home", lambda: tmp_path)
 

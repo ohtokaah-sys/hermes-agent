@@ -1888,8 +1888,12 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             if queued:
                 # 消息已安全落队列 ⇒ 这是「必达的推迟」，不是失败。
                 # 原实现继续 raise last_error，cron 层会记 delivery_failed（报警失真）。
+                # 2026-10-28：把**原因**一起带出去。原实现丢掉 last_error ⇒ 上游只看到
+                #   「已入补投队列」，session 过期 / rate limited（含 cooldown）/ prepare failed
+                #   全被抹成同一句话，排障时无从判断是窗口问题还是平台故障；也让 3 个
+                #   「错误文本要点名真因」的单测变红（确实是可观测性退化）。
                 raise _DeferredToRetryQueue(
-                    f"消息已入补投队列（source={source}），下次入站补发")
+                    f"消息已入补投队列（source={source}），下次入站补发；原因：{last_error}")
             raise last_error
 
     async def _drain_retry_queue(self, wake_suspended: bool = False) -> None:
@@ -2267,16 +2271,22 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                             chunk_kwargs["no_retry"] = True
                         try:
                             await self._send_text_chunk(**chunk_kwargs)
-                        except Exception:
+                        except Exception as _chunk_exc:
                             # 零丢失（2026-10-27 插队修）：多 chunk 消息在第 k 条失败时，
                             # 原实现直接抛出 ⇒ 第 k+1..n 条**从未发送也从未入队**，尾部静默丢失。
-                            # 这里把「本条 + 剩余」按原顺序全部入补投队列（同 hash 幂等，
-                            # 已入队的那条不会重复），再向上抛。
+                            # 这里把「本条 + 剩余」按原顺序全部入补投队列，再向上抛。
                             # in_drain 时不入队：队列里已有该条的权威全文（再入就是第二条）。
                             # no_retry 时也不入队：控制/收尾消息失败必须丢弃，不能自我复制。
+                            # 2026-10-28 修：`_DeferredToRetryQueue` 表示**本条已由
+                            #   _send_text_chunk 自己入队**（同 hash 幂等，但 attempts 会 +1）。
+                            #   原实现照样从 chunks[idx] 再入一遍 ⇒ 一次真实失败吃两次 attempts，
+                            #   _RETRY_MAX_ATTEMPTS=3 被两次失败打满 → 提前 suspended（suspended
+                            #   只在入站唤醒时才重试）⇒ 消息长期躺在队列里。
+                            #   实测 2026-10-28 state/weixin_retry.jsonl 存在 attempts=7 / suspended。
+                            _already_queued = isinstance(_chunk_exc, _DeferredToRetryQueue)
                             if not in_drain and not no_retry:
                                 _missed = 0
-                                for _rest in chunks[idx:]:
+                                for _rest in (chunks[idx + 1:] if _already_queued else chunks[idx:]):
                                     if not _retry_enqueue(chat_id, _rest, source=source):
                                         _missed += 1
                                 if _missed:
@@ -2480,7 +2490,12 @@ async def _deliver_direct(
     if cleaned:
         last_result = await adapter.send(chat_id, cleaned)
         if not last_result.success:
-            return {"error": f"Weixin send failed: {last_result.error}"}
+            out: dict[str, Any] = {"error": f"Weixin send failed: {last_result.error}"}
+            # 2026-10-28：把「已落补投队列」的推迟信号带进 dict —— cron 的 standalone 车道
+            #   据此不再记终态失败（live 车道同一批修在 gateway/delivery.py）。
+            if getattr(last_result, "deferred", False):
+                out["deferred"] = True
+            return out
     for media_path, _is_voice in media_files or []:
         sender = adapter.send_image_file if Path(media_path).suffix.lower() in _DIRECT_IMAGE_EXTS else adapter.send_document
         last_result = await sender(chat_id, media_path)
