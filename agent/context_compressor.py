@@ -1203,7 +1203,7 @@ _CAP_OMIT_NOTE = "…[机械封顶：省略 {dropped} 条 / {chars} 字符（原
 _CAP_OMIT_MARK = "…[机械封顶：省略"
 
 
-def _cap_append_jsonl(path: str, record: Dict[str, Any]) -> str:
+def _cap_append_jsonl(path: str, record: dict[str, Any]) -> str:
     """Best-effort append-only JSONL write; never raises into the summary path."""
     try:
         target = os.path.expanduser(path)
@@ -1216,7 +1216,7 @@ def _cap_append_jsonl(path: str, record: Dict[str, Any]) -> str:
         return ""
 
 
-def _cap_parse_sections(text: str) -> List[Dict[str, Any]]:
+def _cap_parse_sections(text: str) -> list[dict[str, Any]]:
     """机械枚举全文 `^## ` 节（禁白名单遍历，未识别节默认进兜底组）"""
     secs, cur = [], {"head": "(pre)", "lines": []}
     for line in text.split("\n"):
@@ -1229,7 +1229,7 @@ def _cap_parse_sections(text: str) -> List[Dict[str, Any]]:
     return [s for s in secs if s["lines"] or s["head"] != "(pre)"]
 
 
-def _cap_split_items(lines: List[str]) -> List[str]:
+def _cap_split_items(lines: list[str]) -> list[str]:
     """条目切分：空行分段 + 列表项独立 + 续行归并 + 代码块排除"""
     out, buf, in_code = [], [], False
     for line in lines:
@@ -1243,10 +1243,7 @@ def _cap_split_items(lines: List[str]) -> List[str]:
                 out.append("\n".join(buf))
                 buf = []
             continue
-        if line.lstrip().startswith(("-", "*", "•", "###")) and buf:
-            out.append("\n".join(buf))
-            buf = [line]
-        elif re.match(r"^\s*\d+[.)]\s", line) and buf:
+        if line.lstrip().startswith(("-", "*", "•", "###")) and buf or re.match(r"^\s*\d+[.)]\s", line) and buf:
             out.append("\n".join(buf))
             buf = [line]
         else:
@@ -1256,7 +1253,7 @@ def _cap_split_items(lines: List[str]) -> List[str]:
     return [p.strip() for p in out if p.strip()]
 
 
-def _cap_build_items(secs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _cap_build_items(secs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     items = []
     for si, s in enumerate(secs):
         for it in _cap_split_items(s["lines"]):
@@ -1268,7 +1265,7 @@ def _cap_guard_hit(text: str) -> bool:
     return any(p.search(text) for p in _CAP_GUARD_PATTERNS)
 
 
-def _cap_render(items: List[Dict[str, Any]], keep: set) -> str:
+def _cap_render(items: list[dict[str, Any]], keep: set) -> str:
     """按原顺序拼回：节标题只出现一次 + 被选中条目原文照搬"""
     out, cur = [], None
     for i, it in enumerate(items):
@@ -3814,7 +3811,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         return result
 
 
-    def _cap_summary_body(self, summary: str, turns_to_summarize: List[Dict[str, Any]]) -> str:
+    def _cap_summary_body(self, summary: str, turns_to_summarize: list[dict[str, Any]]) -> str:
         """Deterministic char-budget cap over the LLM summary body (甲方案, ADR_20260914).
 
         Zero model calls: guard items (paths / hashes / filenames / decisions / ledger numbers)
@@ -3893,9 +3890,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             else:
                 self._summary_cap_alert_streak = 0
             if dropped:
-                archive_path = ("%s/%s/%s_%s.jsonl" % (
-                    _CAP_ARCHIVE_DIR, time.strftime("%Y-%m-%d"),
-                    session_id or "unknown", time.strftime("%H%M%S")))
+                archive_path = (f"{_CAP_ARCHIVE_DIR}/{time.strftime('%Y-%m-%d')}/"
+                                f"{session_id or 'unknown'}_{time.strftime('%H%M%S')}.jsonl")
                 archive_file = _cap_append_jsonl(archive_path, {
                     "ts": stamp, "session_id": session_id, "budget_chars": budget_chars,
                     "sha256_before": sha_before,
@@ -3915,7 +3911,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             logger.warning("Summary cap: failed — returning uncapped summary", exc_info=True)
             return summary
 
-    def _augment_summary_lean(self, summary: str, turns_to_summarize: List[Dict[str, Any]]) -> str:
+    def _augment_summary_lean(self, summary: str, turns_to_summarize: list[dict[str, Any]]) -> str:
 
         """Append deterministic lean-mode sections to a summary; no-op in legacy mode."""
         if getattr(self, "tail_mode", "lean") != "lean":

@@ -110,6 +110,23 @@ def store(tmp_path, monkeypatch):
     return s
 
 
+@pytest.fixture()
+def routed_uncategorized(monkeypatch):
+    """Stub the local write router with an "unknown → warn" verdict.
+
+    The real router lives in the profile's scripts/ directory, outside the package,
+    so under test isolation it cannot be imported and memory_tool falls back to a
+    plain write. Tests that assert the warning prefix need the verdict, not the
+    router's own heuristics, so they inject it here.
+    """
+    import types
+    stub = types.SimpleNamespace(
+        check_route=lambda content, target: {"type": "unknown", "action": "write_with_warning"}
+    )
+    monkeypatch.setattr("tools.memory_tool._import_from_scripts", lambda name: stub)
+    return stub
+
+
 class TestMemoryFileLockPermissions:
     def test_new_lock_file_is_owner_only_under_permissive_umask(self, tmp_path):
         memory_path = tmp_path / "MEMORY.md"
@@ -512,13 +529,13 @@ class TestMemoryToolDispatcher:
         assert "fact A refined" in store.memory_entries
         assert "fact A" not in [e for e in store.memory_entries if e == "fact A"]
 
-    def test_new_text_alias_for_content_on_add(self, store):
+    def test_new_text_alias_for_content_on_add(self, store, routed_uncategorized):
         result = json.loads(memory_tool(action="add", new_text="added via new_text", store=store))
         assert result["success"] is True
         # 2026-08-06 routing: 未分类内容默认加 "⚠️未分类" 前缀（两阶段观察期，phase 1）
         assert "⚠️未分类 added via new_text" in store.memory_entries
 
-    def test_content_wins_when_both_content_and_new_text_set(self, store):
+    def test_content_wins_when_both_content_and_new_text_set(self, store, routed_uncategorized):
         result = json.loads(
             memory_tool(action="add", content="the real one", new_text="ignored", store=store)
         )
@@ -526,6 +543,15 @@ class TestMemoryToolDispatcher:
         # 2026-08-06 routing: 未分类内容默认加 "⚠️未分类" 前缀；routing 不区分 content/new_text 别名
         assert "⚠️未分类 the real one" in store.memory_entries
         assert "ignored" not in store.memory_entries
+
+    def test_write_still_succeeds_when_router_is_unavailable(self, store, monkeypatch):
+        """Fail-open by design: a broken router must never block a memory write."""
+        def _raise(name):
+            raise ImportError("memory_routing unavailable")
+        monkeypatch.setattr("tools.memory_tool._import_from_scripts", _raise)
+        result = json.loads(memory_tool(action="add", content="plain fact", store=store))
+        assert result["success"] is True
+        assert "plain fact" in store.memory_entries
 
 
 class TestMemoryBatch:

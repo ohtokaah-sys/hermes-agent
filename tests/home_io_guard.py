@@ -82,6 +82,13 @@ class HomeIOGuard:
                 return
             resolved = self._refuse_installed_app_change(value, absolute) if destructive else None
             roots = tuple(_normcase(os.fspath(r)) for r in self.roots())
+            # Install detection, not state: pm.environments._payload_manifest reads
+            # <home>/manifest.json to decide whether this tree is a sealed payload, and
+            # this checkout lives inside the home, so importing the package probes it.
+            # Reads only — a write to the same path stays refused.
+            if (not destructive and os.path.basename(absolute) == "manifest.json"
+                    and os.path.dirname(absolute) in roots):
+                return
             # Resolving the root itself (get_default_hermes_root's relative_to
             # probe) reads no state; only its contents are guarded.
             if metadata and absolute in roots:
