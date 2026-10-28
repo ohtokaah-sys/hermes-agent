@@ -74,7 +74,7 @@ _SLOWLANE_WAIT_MAX = float(os.getenv("WEIXIN_SLOWLANE_WAIT_MAX", "240"))      # 
 def _slowlane_path() -> Path:
     return Path(get_hermes_home()) / "state" / "weixin_slowlane.json"
 
-def _read_slowlane() -> Dict[str, Any]:
+def _read_slowlane() -> dict[str, Any]:
     """读慢速状态。文件缺失/损坏 → FRESH（不干预正常模式）。
 
     v2 修订: 事件驱动为主、probe 兜底——文件缺失时没有"已过期"证据，不慢速；
@@ -157,11 +157,11 @@ def _quarantine_corrupt(path: str, raw_line: str) -> None:
         logger.warning("[Weixin] corrupt 行隔离失败（原行仍在原文件）：%s", exc)
 
 
-def _load_bucket(path: str) -> List[Dict[str, Any]]:
+def _load_bucket(path: str) -> list[dict[str, Any]]:
     """读一个桶。坏行移 ``.corrupt`` 后跳过，其余照常返回。文件不存在 = 空桶。"""
     if not Path(path).exists():
         return []
-    items: List[Dict[str, Any]] = []
+    items: list[dict[str, Any]] = []
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             if not line.strip():
@@ -178,14 +178,13 @@ def _load_bucket(path: str) -> List[Dict[str, Any]]:
     return items
 
 
-def _save_bucket(path: str, items: List[Dict[str, Any]]) -> None:
+def _save_bucket(path: str, items: list[dict[str, Any]]) -> None:
     """原子写：tmp + ``os.replace``。半写不会把整个队列吃掉。"""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(p.name + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
-        for item in items:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        f.writelines(json.dumps(item, ensure_ascii=False) + "\n" for item in items)
     os.replace(tmp, p)
 
 
@@ -237,7 +236,7 @@ def _retry_enqueue(to: str, text: str, source: str = "cron", *, first_ts: Option
         items = _load_bucket(path)
         now = time.time()
         found = False
-        out: List[Dict[str, Any]] = []
+        out: list[dict[str, Any]] = []
         for item in items:
             # TTL 只清 cron 桶；response 桶无 TTL（半年后也要能补投）
             if not is_response and now - float(item.get("ts", 0)) > _RETRY_TTL_SECONDS:
@@ -259,7 +258,7 @@ def _retry_enqueue(to: str, text: str, source: str = "cron", *, first_ts: Option
         if not found:
             # 2026-08-21: 存完整 text（原 text[:500] 截断——drain 重发时发截断版，
             # 导致「前面一样后面少了」。补投的目的是消息必达，截断违背目的。）
-            entry: Dict[str, Any] = {"id": mid, "ts": now, "first_ts": first_ts or now,
+            entry: dict[str, Any] = {"id": mid, "ts": now, "first_ts": first_ts or now,
                                      "to": to, "text": text, "attempts": 1,
                                      "source": source, "status": "active"}
             if is_response:
@@ -318,7 +317,7 @@ def _retry_remove_by_id(mid: str) -> None:
         except Exception as exc:
             logger.warning("[Weixin] retry_remove_by_id failed (%s): %s", path, exc)
 
-def _retry_dead_letter(item: Dict[str, Any]) -> None:
+def _retry_dead_letter(item: dict[str, Any]) -> None:
     """A方案 (2026-08-21): 挂起 24h 仍无唤醒信号 → 写死信归档（不删内容，可检索可恢复）。
 
     写入 state/weixin_retry_dead.jsonl，保留全文、来源、attempts、原因、时间戳；
@@ -464,7 +463,7 @@ ITEM_TEXT, ITEM_IMAGE, ITEM_VOICE, ITEM_FILE, ITEM_VIDEO = 1, 2, 3, 4, 5  # item
 MSG_TYPE_BOT, MSG_STATE_FINISH = 2, 2
 TYPING_START, TYPING_STOP = 1, 2
 _LIVE_ADAPTERS: dict[str, Any] = {}
-def _is_stale_session_ret(ret: "Optional[int]", errcode: "Optional[int]", errmsg: "Optional[str]") -> bool:
+def _is_stale_session_ret(ret: Optional[int], errcode: Optional[int], errmsg: Optional[str]) -> bool:
     """True when iLink returns ret=-2 / errcode=-2 — iLink treats this as a
     stale-session signal (same class as errcode=-14) when errmsg is NOT a
     recognized genuine-rate-limit wording. iLink's errmsg wording is not
@@ -523,7 +522,7 @@ def _new_session(**kwargs: Any) -> aiohttp.ClientSession:
 # ── 引用消息缓存（持久化，重启不丢）──
 from collections import OrderedDict as _OrderedDict
 _MAX_MSG_CACHE_SIZE = 500
-_msg_text_cache: "_OrderedDict[str, str]" = _OrderedDict()
+_msg_text_cache: _OrderedDict[str, str] = _OrderedDict()
 
 # 持久化缓存：SQLite，存 msg_id→text，重启不丢
 import sqlite3 as _sqlite3
@@ -551,7 +550,7 @@ def _persist_ref_cache(msg_id: str, text: str) -> None:
         db.commit()
         db.close()
 
-def _query_ref_cache(msg_id: str) -> "str | None":
+def _query_ref_cache(msg_id: str) -> str | None:
     with _ref_db_lock:
         db = _sqlite3.connect(_ref_db_path)
         row = db.execute("SELECT text FROM cache WHERE msg_id=?", (msg_id,)).fetchone()
@@ -570,7 +569,7 @@ def _cache_message_text(msg_id: str, text: str) -> None:
 # 出站消息时间队列：iLink send 响应不含 msg_id，用时间戳近似匹配
 # v2 (2026-07-30): 持久化到 JSONL，重启不丢
 _MAX_OUTBOUND_QUEUE = 50
-_outbound_queue: "list[tuple[int, str]]" = []
+_outbound_queue: list[tuple[int, str]] = []
 _outbound_cache_path = str(Path(get_hermes_home()) / "state" / "outbound_queue.jsonl")
 
 def _record_outbound(text: str) -> None:
@@ -589,7 +588,7 @@ def _record_outbound(text: str) -> None:
     except Exception:
         pass
 
-def _lookup_outbound(ref_time_ms: int) -> "str | None":
+def _lookup_outbound(ref_time_ms: int) -> str | None:
     best = None
     for ts, txt in _outbound_queue:
         if ts <= ref_time_ms:
@@ -1044,7 +1043,7 @@ def _extract_text(item_list: list[dict[str, Any]]) -> str:
                 return f"[引用媒体: {title}]\n{text}".strip() if title else f"[引用媒体]\n{text}".strip()
             if ref_item:
 
-                parts: List[str] = []
+                parts: list[str] = []
                 if ref.get("title"):
                     parts.append(str(ref["title"]))
                 ref_text = _extract_text([ref_item])
@@ -1276,7 +1275,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         # 默认 5 分钟 ≤5 条(实测值留余量)。可配置 WEIXIN_SLIDING_WINDOW_SECONDS/MAX。
         self._sliding_window_seconds = float(_extra_or_secret(extra, "sliding_window_seconds", "300.0"))
         self._sliding_window_max = max(1, int(_extra_or_secret(extra, "sliding_window_max", "5")))
-        self._sliding_window_events: List[float] = []
+        self._sliding_window_events: list[float] = []
         self._sliding_gate = asyncio.Lock()
         # 补投风暴断路：同一会话 60s 内失败 5 次 → 暂停该会话补投 300s。
         self._retry_chat_failures: dict[str, list[float]] = {}
@@ -1485,7 +1484,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             _write_slowlane("FRESH", "event-inbound")
             asyncio.create_task(self._drain_retry_queue(wake_suspended=True))
         media_paths, media_types = [], []  # type: List[str], List[str]
-        media_notes: List[str] = []
+        media_notes: list[str] = []
         for item in item_list:
             ref_item = (item.get("ref_msg") or {}).get("message_item")
             for candidate in (item, ref_item) if isinstance(ref_item, dict) else (item,):
@@ -1696,7 +1695,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             item, chat_id=chat_id, sender_id=sender_id, chat_type=chat_type))
         _BACKGROUND_DOWNLOADS.add(task)
 
-        def _done(t: "asyncio.Task[None]") -> None:
+        def _done(t: asyncio.Task[None]) -> None:
             _BACKGROUND_DOWNLOADS.discard(t)
             if t.cancelled():
                 return
@@ -1928,10 +1927,10 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             return
         self._draining = True
         self._drain_wake_pending = False
-        loaded_stats: Dict[str, Optional[Tuple[int, int]]] = {}
+        loaded_stats: dict[str, Optional[tuple[int, int]]] = {}
         try:
             now = time.time()
-            raw: List[Dict[str, Any]] = []
+            raw: list[dict[str, Any]] = []
             # response 桶先补（对话回复优先），再补 cron 桶；每条记住自己属于哪个桶
             # （dict.fromkeys 去重：测试里两个桶可能指向同一文件，重复读会重复补投）
             for _bp in dict.fromkeys((_retry_response_path, _retry_path)):
@@ -1947,8 +1946,8 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     raw.append(_item)
             if not raw:
                 return
-            pending: List[Dict[str, Any]] = []
-            keep: List[Dict[str, Any]] = []
+            pending: list[dict[str, Any]] = []
+            keep: list[dict[str, Any]] = []
             paused_skipped = 0
             for item in raw:
                 if not item.get("to") or not item.get("text"):
@@ -2008,15 +2007,15 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 pending = pending[:MAX_PER_DRAIN]
 
             # 按接收人分组：每个会话一个聚合 markdown；组顺序取排序后的首次出现顺序。
-            groups: Dict[str, List[Dict[str, Any]]] = {}
+            groups: dict[str, list[dict[str, Any]]] = {}
             for item in pending:
                 groups.setdefault(str(item["to"]), []).append(item)
 
             delivered_late = 0
             failed = 0
             total = len(pending)
-            stats_by_to: Dict[str, Dict[str, int]] = {}
-            successful_ids: List[str] = []
+            stats_by_to: dict[str, dict[str, int]] = {}
+            successful_ids: list[str] = []
             for group_idx, (to, group) in enumerate(groups.items()):
                 n = len(group)
                 source = str(group[0].get("source", "cron"))
@@ -2096,7 +2095,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 if group_idx < len(groups) - 1 and DRAIN_GAP_SECONDS > 0:
                     await asyncio.sleep(DRAIN_GAP_SECONDS)
 
-            by_bucket: Dict[str, List[Dict[str, Any]]] = {_retry_response_path: [], _retry_path: []}
+            by_bucket: dict[str, list[dict[str, Any]]] = {_retry_response_path: [], _retry_path: []}
             for item in keep:
                 bp = str(item.pop("_bucket", _retry_path))
                 by_bucket.setdefault(bp, []).append(item)
@@ -2226,8 +2225,8 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     # 短消息路径: 拆分后合并相邻短块 → 减少 sendmessage 调用次数（#184）。
                     # 合并规则: 单块 <500 字符且非代码块 → 以空行连接累积; 累计 ≥2000 或遇大块/代码块 → flush。
                     raw_chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
-                    chunks: List[str] = []
-                    pending: List[str] = []
+                    chunks: list[str] = []
+                    pending: list[str] = []
                     pending_len = 0
                     _MERGE_SHORT_CHUNK_LIMIT = 500   # 单块小于此值才参与合并
                     _MERGE_TOTAL_LIMIT = 1800         # 合并累计上限（留 200 余量避免触碰长消息阈值）
@@ -2256,7 +2255,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
                     for idx, chunk in enumerate(chunks):
                         client_id = f"hermes-weixin-{uuid.uuid4().hex}"
-                        chunk_kwargs: Dict[str, Any] = {
+                        chunk_kwargs: dict[str, Any] = {
                             "chat_id": chat_id,
                             "chunk": chunk,
                             "context_token": context_token,
